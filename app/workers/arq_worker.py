@@ -11,7 +11,6 @@ from app.core.config import GDRIVE_FOLDER_ID
 from app.drive.scanner import scan_drive_incremental
 from app.services.drive_state_store import DriveStateStore
 from app.drive.changes import DriveChangesClient
-from ssl import CERT_NONE
 
 
 # ======================================================
@@ -140,4 +139,20 @@ async def renew_watch_if_needed(ctx):
 # REDIS SETTINGS (HEROKU TLS FIX)
 # ======================================================
 
-from ssl import CERT_NONE
+redis_url = os.environ["REDIS_URL"]
+
+if redis_url.startswith("redis://"):
+    redis_url = redis_url.replace("redis://", "rediss://", 1)
+
+# ======================================================
+class WorkerSettings:
+    redis_settings = RedisSettings.from_dsn(redis_url)
+
+    functions = [process_drive_changes]
+
+    on_startup = startup
+    on_shutdown = shutdown
+
+    cron_jobs = [
+        cron(renew_watch_if_needed, minute={0, 10, 20, 30, 40, 50}),
+    ]
