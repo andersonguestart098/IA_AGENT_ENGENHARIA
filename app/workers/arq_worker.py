@@ -1,10 +1,11 @@
 import os
 import json
+import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 from arq import cron
-from arq.connections import RedisSettings
+from arq.connections import RedisSettings, create_pool
 
 from app.core.mongo import connect_mongo, close_mongo, get_db
 from app.core.config import GDRIVE_FOLDER_ID
@@ -37,17 +38,55 @@ def get_drive_state_store() -> DriveStateStore:
 
 
 # ======================================================
+# REDIS SETTINGS (HEROKU TLS FIX)
+# ======================================================
+
+redis_url = os.environ["REDIS_URL"]
+
+if redis_url.startswith("redis://"):
+    redis_url = redis_url.replace("redis://", "rediss://", 1)
+
+
+class WorkerSettings:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(redis_url)
+
+    redis_settings = RedisSettings(
+        host=parsed.hostname,
+        port=parsed.port,
+        password=parsed.password,
+        ssl=True,
+        ssl_cert_reqs="none",
+    )
+
+    functions = []
+    on_startup = None
+    on_shutdown = None
+    cron_jobs = []
+
+
+# ======================================================
 # STARTUP / SHUTDOWN
 # ======================================================
 
 async def startup(ctx):
     connect_mongo()
+
     ctx["drive"] = get_drive_client()
     ctx["store"] = get_drive_state_store()
+
+    # 🔥 IMPORTANTE — redis disponível no ctx
+    ctx["redis"] = await create_pool(WorkerSettings.redis_settings)
+
     print("[worker] startup ok")
 
 
 async def shutdown(ctx):
+    redis = ctx.get("redis")
+    if redis:
+        await redis.close()
+
     close_mongo()
     print("[worker] shutdown ok")
 
@@ -56,28 +95,52 @@ async def shutdown(ctx):
 # JOB: PROCESS CHANGES
 # ======================================================
 
-async def process_drive_changes(ctx, payload: Optional[Dict[str, Any]] = None):
+async def process_drive_changes(ctx, payload=None):
 
-    store: DriveStateStore = ctx["store"]
-    drive: DriveChangesClient = ctx["drive"]
+    redis = ctx["redis"]
 
-    state = await store.get()
+    # 🔒 LOCK DISTRIBUÍDO SEGURO
+    lock_id = str(uuid.uuid4())
 
-    if not state:
-        print("[worker][process] no state")
-        return {"ok": False}
-
-    changes, new_start = drive.list_all_changes(
-        start_page_token=state.start_page_token
+    lock = await redis.set(
+        "drive:processing",
+        lock_id,
+        nx=True,
+        ex=120,
     )
 
-    print(f"[worker][process] changes={len(changes)}")
+    if not lock:
+        print("[worker] already processing, skipping")
+        return {"ok": False, "reason": "locked"}
 
-    await scan_drive_incremental(GDRIVE_FOLDER_ID)
+    try:
+        store: DriveStateStore = ctx["store"]
+        drive: DriveChangesClient = ctx["drive"]
 
-    await store.update_token(start_page_token=new_start)
+        state = await store.get()
 
-    return {"ok": True, "changes": len(changes)}
+        if not state:
+            print("[worker] no state")
+            return {"ok": False}
+
+        changes, new_start = drive.list_all_changes(
+            start_page_token=state.start_page_token
+        )
+
+        print(f"[worker] changes={len(changes)}")
+
+        await scan_drive_incremental(GDRIVE_FOLDER_ID)
+
+        await store.update_token(start_page_token=new_start)
+
+        return {"ok": True, "changes": len(changes)}
+
+    finally:
+        # 🔥 unlock seguro (não apaga lock alheio)
+        current = await redis.get("drive:processing")
+
+        if current and current.decode() == lock_id:
+            await redis.delete("drive:processing")
 
 
 # ======================================================
@@ -136,33 +199,12 @@ async def renew_watch_if_needed(ctx):
 
 
 # ======================================================
-# REDIS SETTINGS (HEROKU TLS FIX)
+# WORKER SETTINGS FINAL
 # ======================================================
 
-redis_url = os.environ["REDIS_URL"]
-
-if redis_url.startswith("redis://"):
-    redis_url = redis_url.replace("redis://", "rediss://", 1)
-
-# ======================================================
-class WorkerSettings:
-    from urllib.parse import urlparse
-
-    parsed = urlparse(redis_url)
-
-    redis_settings = RedisSettings(
-        host=parsed.hostname,
-        port=parsed.port,
-        password=parsed.password,
-        ssl=True,
-        ssl_cert_reqs="none",
-    )
-
-    functions = [process_drive_changes]
-
-    on_startup = startup
-    on_shutdown = shutdown
-
-    cron_jobs = [
-        cron(renew_watch_if_needed, minute={0, 10, 20, 30, 40, 50}),
-    ]
+WorkerSettings.functions = [process_drive_changes]
+WorkerSettings.on_startup = startup
+WorkerSettings.on_shutdown = shutdown
+WorkerSettings.cron_jobs = [
+    cron(renew_watch_if_needed, minute={0, 10, 20, 30, 40, 50}),
+]
