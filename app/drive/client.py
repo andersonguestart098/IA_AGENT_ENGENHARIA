@@ -1,6 +1,8 @@
 import os
+import json
 import time
 import logging
+from pathlib import Path
 from typing import List, Dict, Optional
 
 from google.oauth2 import service_account
@@ -15,6 +17,49 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 _drive_service = None
 
 
+def _project_root() -> Path:
+    """
+    Resolve a raiz do projeto a partir deste arquivo:
+    app/drive/client.py -> parents[2] = raiz do repo (onde fica Procfile, requirements, etc.)
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_service_account_info() -> Dict:
+    """
+    Carrega credenciais do service account via:
+    1) Produção (Heroku): GOOGLE_SERVICE_ACCOUNT_JSON (JSON completo na env)
+    2) Dev/local: GOOGLE_APPLICATION_CREDENTIALS (caminho para .json)
+    """
+    # 1) Cloud: JSON direto na env
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if raw:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON inválido (JSON mal formatado).") from e
+
+    # 2) Local: caminho do arquivo
+    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if not cred_path:
+        raise RuntimeError(
+            "Credenciais do Drive não configuradas. "
+            "Use GOOGLE_SERVICE_ACCOUNT_JSON (prod) ou GOOGLE_APPLICATION_CREDENTIALS (dev)."
+        )
+
+    p = Path(cred_path)
+    if not p.is_absolute():
+        p = _project_root() / p
+
+    if not p.exists():
+        raise RuntimeError(f"Arquivo de credencial não encontrado: {p}")
+
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Arquivo de credencial inválido (JSON mal formatado): {p}") from e
+
+
 def get_drive_service():
     """
     Singleton simples do client do Drive (reutiliza conexão e cache interno).
@@ -23,15 +68,10 @@ def get_drive_service():
     if _drive_service is not None:
         return _drive_service
 
-    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if not cred_path:
-        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS não configurado no .env")
+    sa_info = _load_service_account_info()
 
-    if not os.path.exists(cred_path):
-        raise RuntimeError(f"Arquivo de credencial não encontrado: {cred_path}")
-
-    creds = service_account.Credentials.from_service_account_file(
-        cred_path,
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info,
         scopes=SCOPES,
     )
 
@@ -147,7 +187,9 @@ def list_files_in_folder(
 
             if attempt >= max_retries or not _should_retry_http_error(e):
                 log.exception("Falha definitiva listando folder_id=%s q=%s", folder_id, q)
-                raise RuntimeError(f"Erro no Google Drive API ao listar folder_id={folder_id}") from e
+                raise RuntimeError(
+                    f"Erro no Google Drive API ao listar folder_id={folder_id}"
+                ) from e
 
             # backoff exponencial simples
             sleep_s = retry_base_sleep * (2 ** (attempt - 1))
