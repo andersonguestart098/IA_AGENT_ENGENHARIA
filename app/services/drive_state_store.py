@@ -8,10 +8,10 @@ from typing import Optional, Any, Dict
 from pymongo import ReturnDocument
 
 try:
-    # Motor (async) - recomendado no teu projeto
+    # Motor (async)
     from motor.motor_asyncio import AsyncIOMotorCollection
 except Exception:  # pragma: no cover
-    AsyncIOMotorCollection = Any  # fallback typing
+    AsyncIOMotorCollection = Any  # typing fallback
 
 
 @dataclass
@@ -20,7 +20,7 @@ class DriveWatchState:
     start_page_token: str
     channel_id: str
     resource_id: str
-    expiration_ms: Optional[int] = None  # epoch ms from Drive
+    expiration_ms: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -44,9 +44,9 @@ class DriveStateStore:
     def _to_state(self, doc: Dict[str, Any]) -> DriveWatchState:
         return DriveWatchState(
             id=str(doc["_id"]),
-            start_page_token=doc.get("start_page_token", ""),
-            channel_id=doc.get("channel_id", ""),
-            resource_id=doc.get("resource_id", ""),
+            start_page_token=doc.get("start_page_token", "") or "",
+            channel_id=doc.get("channel_id", "") or "",
+            resource_id=doc.get("resource_id", "") or "",
             expiration_ms=doc.get("expiration_ms"),
             created_at=doc.get("created_at"),
             updated_at=doc.get("updated_at"),
@@ -54,9 +54,7 @@ class DriveStateStore:
 
     async def get(self) -> Optional[DriveWatchState]:
         doc = await self.col.find_one({"_id": self.key})
-        if not doc:
-            return None
-        return self._to_state(doc)
+        return self._to_state(doc) if doc else None
 
     async def upsert_watch(
         self,
@@ -75,7 +73,7 @@ class DriveStateStore:
                     "start_page_token": start_page_token,
                     "channel_id": channel_id,
                     "resource_id": resource_id,
-                    "expiration_ms": expiration_ms,
+                    "expiration_ms": int(expiration_ms) if expiration_ms is not None else None,
                     "updated_at": now,
                 },
                 "$setOnInsert": {"created_at": now},
@@ -84,8 +82,7 @@ class DriveStateStore:
             return_document=ReturnDocument.AFTER,
         )
 
-        # Em casos raros, pode voltar None dependendo de driver/config.
-        # Garantimos buscando de novo.
+        # Em casos raros pode vir None dependendo do driver/config
         if not doc:
             doc = await self.col.find_one({"_id": self.key})
             if not doc:

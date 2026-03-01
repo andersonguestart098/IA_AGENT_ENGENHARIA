@@ -1,94 +1,161 @@
-# app/drive/changes.py
 from __future__ import annotations
 
 import os
-import uuid
-from typing import Dict, Any, Optional
+import json
+from typing import Any, Dict, List, Optional, Tuple
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
-# Para só leitura + watch, na prática precisa do escopo de drive (watch é "write-ish").
-# Se quiser testar com readonly e der 403, troca pra SCOPES acima (já está).
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 
 class DriveChangesClient:
-    def __init__(self, *, service_account_info: Dict[str, Any]):
+    """
+    Client responsável por:
+
+    - start_page_token
+    - listagem de changes
+    - watch (webhook)
+    - lookup rápido por file_id
+    """
+
+    def __init__(self, service_account_info: Dict[str, Any]):
         creds = service_account.Credentials.from_service_account_info(
             service_account_info,
             scopes=SCOPES,
         )
 
-        self.svc = build(
-            "drive",
-            "v3",
-            credentials=creds,
-            cache_discovery=False,
-        )
+        self.service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    # ======================================================
+    # TOKENS / CHANGES
+    # ======================================================
 
     def get_start_page_token(self) -> str:
-        resp = self.svc.changes().getStartPageToken().execute()
+        resp = self.service.changes().getStartPageToken().execute()
         return resp["startPageToken"]
 
-    def list_all_changes(self, *, start_page_token: str) -> tuple[list[dict], str]:
+    def list_all_changes(
+        self,
+        start_page_token: str,
+    ) -> Tuple[List[Dict[str, Any]], str]:
         """
-        Busca changes a partir do token, paginando até acabar.
-        Retorna (changes, new_start_page_token).
+        Retorna:
+            (changes, new_start_page_token)
         """
-        page_token = start_page_token
-        all_changes: list[dict] = []
 
-        while True:
+        changes: List[Dict[str, Any]] = []
+        page_token = start_page_token
+        new_start_token = start_page_token
+
+        while page_token:
             resp = (
-                self.svc.changes()
+                self.service.changes()
                 .list(
                     pageToken=page_token,
                     spaces="drive",
-                    includeRemoved=True,
-                    supportsAllDrives=True,
                     includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                    fields="nextPageToken,newStartPageToken,changes(fileId,file,removed)",
                 )
                 .execute()
             )
 
-            all_changes.extend(resp.get("changes", []))
+            changes.extend(resp.get("changes", []))
 
             page_token = resp.get("nextPageToken")
-            if not page_token:
-                new_start = resp.get("newStartPageToken", start_page_token)
-                return all_changes, new_start
+            if resp.get("newStartPageToken"):
+                new_start_token = resp["newStartPageToken"]
+
+        return changes, new_start_token
+
+    # ======================================================
+    # WATCH (WEBHOOK)
+    # ======================================================
 
     def watch_changes(
         self,
-        *,
         webhook_url: str,
         token: str,
         page_token: str,
-        channel_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Cria um 'channel' e registra o webhook para mudanças.
-        O Drive EXIGE pageToken como PARAM na chamada watch.
+        Cria watch channel no Google Drive.
         """
-        channel_id = channel_id or str(uuid.uuid4())
 
         body = {
-            "id": channel_id,
+            "id": f"drive-watch-{os.urandom(6).hex()}",
             "type": "web_hook",
             "address": webhook_url,
             "token": token,
         }
 
-        # ✅ AQUI: pageToken obrigatório
-        resp = (
-            self.svc.changes()
-            .watch(pageToken=page_token, body=body)
+        return (
+            self.service.changes()
+            .watch(
+                pageToken=page_token,
+                body=body,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            )
             .execute()
         )
-        return resp
 
-    def stop_channel(self, *, channel_id: str, resource_id: str) -> None:
-        body = {"id": channel_id, "resourceId": resource_id}
-        self.svc.channels().stop(body=body).execute()
+    def stop_channel(self, channel_id: str, resource_id: str) -> None:
+        try:
+            self.service.channels().stop(
+                body={
+                    "id": channel_id,
+                    "resourceId": resource_id,
+                }
+            ).execute()
+        except Exception as e:
+            print(f"[drive][stop_channel] warn: {e}")
+
+    # ======================================================
+    # FILE LOOKUP (🔥 NOVO — PROCESSA SÓ IDs)
+    # ======================================================
+
+    def get_file_metadata(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Busca metadados completos do arquivo por ID.
+        Usado quando change não traz 'file'.
+        """
+
+        try:
+            return (
+                self.service.files()
+                .get(
+                    fileId=file_id,
+                    fields="id,name,mimeType,modifiedTime,size,parents,trashed",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+        except HttpError as e:
+            # 404 / 403 etc
+            print(f"[drive][get_file_metadata] warn file_id={file_id} err={e}")
+            return None
+
+    def get_folder_name(self, folder_id: str) -> Optional[str]:
+        """
+        Busca nome da pasta pai.
+        """
+
+        try:
+            meta = (
+                self.service.files()
+                .get(
+                    fileId=folder_id,
+                    fields="id,name",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+            return meta.get("name")
+        except HttpError as e:
+            print(f"[drive][get_folder_name] warn folder_id={folder_id} err={e}")
+            return None

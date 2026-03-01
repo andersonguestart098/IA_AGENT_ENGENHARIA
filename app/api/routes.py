@@ -59,31 +59,58 @@ async def drive_webhook(request: Request):
     app = request.app
     h = request.headers
 
+    # headers padrão do Drive
     channel_id = h.get("x-goog-channel-id")
     resource_id = h.get("x-goog-resource-id")
     token = h.get("x-goog-channel-token")
+    resource_state = (h.get("x-goog-resource-state") or "").lower()
+    message_number = h.get("x-goog-message-number")  # string
 
+    # 1) secret
     secret = getattr(app.state, "drive_webhook_secret", None)
     if not secret:
         raise HTTPException(500, "drive_webhook_secret missing in app.state")
-
     if token != secret:
         raise HTTPException(401, "invalid token")
 
+    # 2) state store
     store = getattr(app.state, "drive_state_store", None)
     if not store:
         raise HTTPException(500, "drive_state_store missing")
-    state = await store.get()
 
+    state = await store.get()
     if not state:
         raise HTTPException(409, "watch not initialized")
 
     if channel_id != state.channel_id or resource_id != state.resource_id:
         raise HTTPException(409, "unknown channel")
 
+    # 3) ignora eventos que não são mudança real
+    # sync = handshake/primeira notificação
+    # not_exists = canal expirou/recurso inválido
+    if resource_state in {"sync", "not_exists"}:
+        return {"ok": True, "ignored": resource_state}
+
+    # 4) redis obrigatório
     redis = getattr(app.state, "redis", None)
     if not redis:
         raise HTTPException(500, "redis pool missing in app.state")
 
+    # 5) DEDUPE por message_number (TTL 1h)
+    # (se message_number vier vazio, ainda funciona só com throttle)
+    if message_number:
+        dedupe_key = f"drive:webhook:dedupe:{channel_id}:{message_number}"
+        first = await redis.set(dedupe_key, "1", nx=True, ex=3600)
+        if not first:
+            return {"ok": True, "deduped": True}
+
+    # 6) THROTTLE: não enfileira um job a cada notificação (TTL curto)
+    # útil quando chegam 20 webhooks em sequência.
+    cooldown_key = "drive:webhook:cooldown"
+    cooldown = await redis.set(cooldown_key, "1", nx=True, ex=10)
+    if not cooldown:
+        return {"ok": True, "throttled": True}
+
+    # 7) enqueue job
     await redis.enqueue_job("process_drive_changes", {"source": "webhook"})
-    return {"ok": True}
+    return {"ok": True, "enqueued": True, "state": resource_state}
