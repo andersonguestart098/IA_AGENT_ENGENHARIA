@@ -90,11 +90,7 @@ async def lifespan(app: FastAPI):
         redis_url = redis_url.replace("redis://", "rediss://", 1)
 
     app.state.redis = await create_pool(
-        RedisSettings.from_dsn(
-            redis_url,
-            ssl=True,
-            ssl_cert_reqs="none",
-        )
+        RedisSettings.from_dsn(redis_url)
     )
 
     if DRIVE_USE_POLLING:
