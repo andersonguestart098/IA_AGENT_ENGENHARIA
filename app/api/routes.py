@@ -6,6 +6,7 @@ from app.workers.demo_worker import run_demo_job
 from app.drive.scanner import scan_drive_incremental
 from app.core.config import GDRIVE_FOLDER_ID
 from app.drive.client import list_files_in_folder
+from app.ingest.qdrant_indexer import get_qdrant
 
 router = APIRouter()
 
