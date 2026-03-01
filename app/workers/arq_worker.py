@@ -11,6 +11,7 @@ from app.core.mongo import connect_mongo, close_mongo, get_db
 from app.services.drive_state_store import DriveStateStore
 from app.drive.changes import DriveChangesClient
 from app.services.drive_store import upsert_drive_file, mark_drive_file_deleted
+from app.ingest.drive_index_pipeline import index_new_drive_files
 
 
 # ======================================================
@@ -282,6 +283,21 @@ async def renew_watch_if_needed(ctx):
     )
 
     print("[worker][renew] renewed ok")
+
+    async def index_new_files_job(ctx, payload=None):
+        # lock separado (não conflita com o processamento de changes)
+        redis = ctx["redis"]
+        got_lock = await redis.set("drive:indexing", "1", nx=True, ex=180)
+        if not got_lock:
+            print("[worker][index] already indexing, skipping")
+            return {"ok": False, "reason": "locked"}
+
+        try:
+            res = await index_new_drive_files(limit=25)
+            print(f"[worker][index] {res}")
+            return res
+        finally:
+            await redis.delete("drive:indexing")
 
 
 # ======================================================
