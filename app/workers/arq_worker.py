@@ -141,14 +141,19 @@ async def renew_watch_if_needed(ctx):
 
 
 class WorkerSettings:
-    redis_settings = RedisSettings.from_dsn(os.environ["REDIS_URL"])
+    # 🔥 HEROKU REDIS (TLS obrigatório)
+    redis_settings = RedisSettings.from_dsn(
+        os.environ["REDIS_URL"],
+        ssl=True,
+        ssl_cert_reqs="none",
+    )
 
     functions = [process_drive_changes]
 
     on_startup = startup
     on_shutdown = shutdown
 
-    # roda a cada 10 minutos (ajusta)
+    # roda a cada 10 minutos
     cron_jobs = [
         cron(renew_watch_if_needed, minute={0, 10, 20, 30, 40, 50}),
     ]
