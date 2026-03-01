@@ -23,7 +23,8 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-load_dotenv(PROJECT_ROOT / ".env")
+if os.getenv("APP_ENV", "local") == "local":
+    load_dotenv(PROJECT_ROOT / ".env")
 
 
 # ====================================================
@@ -53,31 +54,36 @@ from pathlib import Path
 print("PROJECT_ROOT:", PROJECT_ROOT)
 print("CRED:", os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
 
+from pathlib import Path
+import os
+import json
+
 def get_drive_client() -> DriveChangesClient:
-    # 1) Heroku / produção: JSON direto na env
+    # Produção (Heroku): JSON direto na env
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if raw:
         sa_info = json.loads(raw)
+        # log seguro (sem secrets)
+        print(f"[drive] credentials_source=env_json client_email={sa_info.get('client_email')}")
         return DriveChangesClient(service_account_info=sa_info)
 
-    # 2) Dev: caminho do arquivo
+    # Dev (local): caminho do arquivo
     cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if not cred_path:
         raise RuntimeError(
-            "Credenciais não configuradas. Use GOOGLE_SERVICE_ACCOUNT_JSON "
-            "ou GOOGLE_APPLICATION_CREDENTIALS."
+            "Credenciais não configuradas. Use GOOGLE_SERVICE_ACCOUNT_JSON (prod) "
+            "ou GOOGLE_APPLICATION_CREDENTIALS (dev)."
         )
 
     p = Path(cred_path)
-
-    # Se veio relativo (tipo secrets/xxx.json), resolve a partir da raiz do projeto
     if not p.is_absolute():
-        p = PROJECT_ROOT / p  # usa o PROJECT_ROOT que definimos no topo
+        p = PROJECT_ROOT / p
 
     if not p.exists():
         raise RuntimeError(f"Arquivo de credenciais não encontrado: {p}")
 
     sa_info = json.loads(p.read_text(encoding="utf-8"))
+    print(f"[drive] credentials_source=file_path client_email={sa_info.get('client_email')}")
     return DriveChangesClient(service_account_info=sa_info)
 
 
