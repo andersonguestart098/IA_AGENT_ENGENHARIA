@@ -114,3 +114,12 @@ async def drive_webhook(request: Request):
     # 7) enqueue job
     await redis.enqueue_job("process_drive_changes", {"source": "webhook"})
     return {"ok": True, "enqueued": True, "state": resource_state}
+
+@router.get("/qdrant/ping")
+async def qdrant_ping():
+    try:
+        client = get_qdrant()
+        info = client.get_collections()
+        return {"ok": True, "collections": [c.name for c in info.collections]}
+    except Exception as e:
+        raise HTTPException(500, f"qdrant ping failed: {e}")
