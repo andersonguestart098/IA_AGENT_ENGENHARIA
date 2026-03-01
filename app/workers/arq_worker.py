@@ -136,7 +136,7 @@ async def renew_watch_if_needed(ctx):
 
 
 # ======================================================
-# REDIS SETTINGS (HEROKU FIX)
+# REDIS SETTINGS (HEROKU TLS FIX)
 # ======================================================
 
 redis_url = os.environ["REDIS_URL"]
@@ -146,11 +146,7 @@ if redis_url.startswith("redis://"):
 
 
 class WorkerSettings:
-    redis_settings = RedisSettings.from_dsn(
-        redis_url,
-        ssl=True,
-        ssl_cert_reqs="none",
-    )
+    redis_settings = RedisSettings.from_dsn(redis_url)
 
     functions = [process_drive_changes]
 
