@@ -224,6 +224,7 @@ def create_app() -> FastAPI:
         resp = drive.watch_changes(
             webhook_url=webhook_url,
             token=DRIVE_WEBHOOK_SECRET,
+            page_token=start_token,
         )
 
         await store.upsert_watch(
