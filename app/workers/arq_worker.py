@@ -8,10 +8,9 @@ from arq import cron
 from arq.connections import RedisSettings, create_pool
 
 from app.core.mongo import connect_mongo, close_mongo, get_db
-from app.core.config import GDRIVE_FOLDER_ID
 from app.services.drive_state_store import DriveStateStore
 from app.drive.changes import DriveChangesClient
-from app.services.drive_store import upsert_drive_file
+from app.services.drive_store import upsert_drive_file, mark_drive_file_deleted
 
 
 # ======================================================
@@ -59,7 +58,7 @@ class WorkerSettings:
         port=parsed.port or 6379,
         password=parsed.password,
         ssl=True,
-        ssl_cert_reqs="none",  # Heroku Redis usa cadeia que frequentemente dá CERT_VERIFY_FAILED
+        ssl_cert_reqs="none",  # Heroku Redis: evita CERT_VERIFY_FAILED
     )
 
     functions = []
@@ -100,27 +99,11 @@ async def shutdown(ctx):
 def _normalize_file_for_upsert(file_obj: Dict[str, Any]) -> Dict[str, Any]:
     """
     Garante que o documento tenha as chaves que o upsert usa.
+    Drive API usa "id"; changes usa "fileId".
     """
     if "id" not in file_obj and "fileId" in file_obj:
         file_obj["id"] = file_obj["fileId"]
     return file_obj
-
-
-async def _mark_removed(file_id: str) -> None:
-    """
-    Marca arquivo removido/trashed (mantém histórico no Mongo).
-    """
-    await upsert_drive_file(
-        {
-            "id": file_id,
-            "name": None,
-            "mimeType": None,
-            "size": None,
-            "modifiedTime": None,
-            "removed": True,
-            "trashed": True,
-        }
-    )
 
 
 async def _process_changes_only_ids(
@@ -128,40 +111,67 @@ async def _process_changes_only_ids(
     changes: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    - Se change.removed => marca removido
-    - Se change.file vier => upsert direto
-    - Se change.file NÃO vier => busca drive.get_file(fileId) e upsert
+    - Se change.removed=True => marca DELETED (sem inventar doc fake)
+    - Se change.file vier => upsert usando esse objeto
+    - Se change.file NÃO vier => busca via drive.get_file_metadata(fileId)
+    - Preenche parent_folder_id e parent_folder_name (cache)
     """
     upserted = 0
-    removed = 0
+    deleted = 0
     fetched_by_id = 0
     skipped = 0
     errors: List[str] = []
 
+    folder_name_cache: Dict[str, str] = {}
+
     for ch in changes:
         file_id = ch.get("fileId")
-        is_removed = bool(ch.get("removed"))
+        removed = bool(ch.get("removed", False))
 
         if not file_id:
             skipped += 1
             continue
 
         try:
-            if is_removed:
-                await _mark_removed(file_id)
-                removed += 1
+            # 1) removido
+            if removed:
+                await mark_drive_file_deleted(file_id, reason="removed")
+                deleted += 1
                 continue
 
+            # 2) pega objeto file (se veio), senão busca por id
             file_obj = ch.get("file")
             if not file_obj:
-                # não veio objeto completo -> busca por ID
-                file_obj = drive.get_file(file_id)
+                file_obj = drive.get_file_metadata(file_id)
                 if not file_obj:
-                    skipped += 1
+                    # sem acesso / 404/403 -> marca deleted soft
+                    await mark_drive_file_deleted(file_id, reason="metadata_unavailable")
+                    deleted += 1
                     continue
                 fetched_by_id += 1
 
             file_obj = _normalize_file_for_upsert(file_obj)
+
+            # 3) se trashed, marca deleted
+            if file_obj.get("trashed") is True:
+                await mark_drive_file_deleted(file_id, reason="trashed")
+                deleted += 1
+                continue
+
+            # 4) preenche parent_folder_id/name
+            parents = file_obj.get("parents") or []
+            parent_id = parents[0] if parents else None
+
+            parent_name = None
+            if parent_id:
+                parent_name = folder_name_cache.get(parent_id)
+                if parent_name is None:
+                    parent_name = drive.get_folder_name(parent_id) or ""
+                    folder_name_cache[parent_id] = parent_name
+
+            file_obj["parent_folder_id"] = parent_id
+            file_obj["parent_folder_name"] = parent_name
+
             await upsert_drive_file(file_obj)
             upserted += 1
 
@@ -170,7 +180,7 @@ async def _process_changes_only_ids(
 
     return {
         "upserted": upserted,
-        "removed": removed,
+        "deleted": deleted,
         "fetched_by_id": fetched_by_id,
         "skipped": skipped,
         "errors": errors[:20],
@@ -201,22 +211,19 @@ async def process_drive_changes(ctx, payload: Optional[Dict[str, Any]] = None):
             print("[worker] no state")
             return {"ok": False, "reason": "no_state"}
 
-        changes, new_start = drive.list_all_changes(
-            start_page_token=state.start_page_token
-        )
-
+        changes, new_start = drive.list_all_changes(start_page_token=state.start_page_token)
         n = len(changes or [])
         print(f"[worker] changes={n}")
 
-        # ✅ Otimização: se não tem changes, só avança token e sai
+        # ✅ se não tem changes, só avança token e sai
         if n == 0:
             await store.update_token(start_page_token=new_start)
             return {"ok": True, "changes": 0, "skipped": "no_changes"}
 
-        # ✅ Processa SOMENTE os IDs afetados (sem BFS)
+        # ✅ processa SOMENTE os IDs afetados (sem BFS)
         stats = await _process_changes_only_ids(drive, changes)
 
-        # Atualiza token do Drive Changes SEMPRE
+        # atualiza token SEMPRE
         await store.update_token(start_page_token=new_start)
 
         return {"ok": True, "changes": n, "stats": stats}
