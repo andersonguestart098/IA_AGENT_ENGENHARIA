@@ -146,7 +146,17 @@ if redis_url.startswith("redis://"):
 
 # ======================================================
 class WorkerSettings:
-    redis_settings = RedisSettings.from_dsn(redis_url)
+    from urllib.parse import urlparse
+
+    parsed = urlparse(redis_url)
+
+    redis_settings = RedisSettings(
+        host=parsed.hostname,
+        port=parsed.port,
+        password=parsed.password,
+        ssl=True,
+        ssl_cert_reqs="none",
+    )
 
     functions = [process_drive_changes]
 

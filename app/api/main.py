@@ -90,8 +90,18 @@ async def lifespan(app: FastAPI):
     if redis_url.startswith("redis://"):
         redis_url = redis_url.replace("redis://", "rediss://", 1)
 
+    from urllib.parse import urlparse
+
+    parsed = urlparse(redis_url)
+
     app.state.redis = await create_pool(
-        RedisSettings.from_dsn(redis_url)
+        RedisSettings(
+            host=parsed.hostname,
+            port=parsed.port,
+            password=parsed.password,
+            ssl=True,
+            ssl_cert_reqs="none",  # HEROKU FIX
+        )
     )
 
     if DRIVE_USE_POLLING:
