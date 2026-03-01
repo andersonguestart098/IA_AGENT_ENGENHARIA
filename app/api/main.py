@@ -19,6 +19,7 @@ from app.core.config import GDRIVE_FOLDER_ID
 from app.drive.scanner import scan_drive_incremental
 from app.drive.changes import DriveChangesClient
 from app.services.drive_state_store import DriveStateStore
+from ssl import CERT_NONE
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -86,11 +87,19 @@ async def lifespan(app: FastAPI):
 
     redis_url = os.environ["REDIS_URL"]
 
+    redis_url = os.environ["REDIS_URL"]
+
     if redis_url.startswith("redis://"):
         redis_url = redis_url.replace("redis://", "rediss://", 1)
 
     app.state.redis = await create_pool(
-        RedisSettings.from_dsn(redis_url)
+        RedisSettings(
+            host=redis_url.split("@")[1].split(":")[0],
+            port=int(redis_url.split(":")[-1]),
+            password=redis_url.split(":")[2].split("@")[0],
+            ssl=True,
+            ssl_cert_reqs=CERT_NONE,
+        )
     )
 
     if DRIVE_USE_POLLING:
