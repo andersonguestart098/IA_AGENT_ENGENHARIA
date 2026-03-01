@@ -5,8 +5,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Any, Dict
 
-from pymongo.collection import Collection
 from pymongo import ReturnDocument
+
+try:
+    # Motor (async) - recomendado no teu projeto
+    from motor.motor_asyncio import AsyncIOMotorCollection
+except Exception:  # pragma: no cover
+    AsyncIOMotorCollection = Any  # fallback typing
 
 
 @dataclass
@@ -32,25 +37,28 @@ class DriveStateStore:
       updated_at: datetime
     """
 
-    def __init__(self, collection: Collection, key: str = "primary"):
+    def __init__(self, collection: AsyncIOMotorCollection, key: str = "primary"):
         self.col = collection
         self.key = key
 
-    def get(self) -> Optional[DriveWatchState]:
-        doc = self.col.find_one({"_id": self.key})
-        if not doc:
-            return None
+    def _to_state(self, doc: Dict[str, Any]) -> DriveWatchState:
         return DriveWatchState(
-            id=doc["_id"],
-            start_page_token=doc["start_page_token"],
-            channel_id=doc["channel_id"],
-            resource_id=doc["resource_id"],
+            id=str(doc["_id"]),
+            start_page_token=doc.get("start_page_token", ""),
+            channel_id=doc.get("channel_id", ""),
+            resource_id=doc.get("resource_id", ""),
             expiration_ms=doc.get("expiration_ms"),
             created_at=doc.get("created_at"),
             updated_at=doc.get("updated_at"),
         )
 
-    def upsert_watch(
+    async def get(self) -> Optional[DriveWatchState]:
+        doc = await self.col.find_one({"_id": self.key})
+        if not doc:
+            return None
+        return self._to_state(doc)
+
+    async def upsert_watch(
         self,
         *,
         start_page_token: str,
@@ -59,7 +67,8 @@ class DriveStateStore:
         expiration_ms: Optional[int],
     ) -> DriveWatchState:
         now = datetime.now(timezone.utc)
-        doc = self.col.find_one_and_update(
+
+        doc = await self.col.find_one_and_update(
             {"_id": self.key},
             {
                 "$set": {
@@ -74,26 +83,27 @@ class DriveStateStore:
             upsert=True,
             return_document=ReturnDocument.AFTER,
         )
-        return DriveWatchState(
-            id=doc["_id"],
-            start_page_token=doc["start_page_token"],
-            channel_id=doc["channel_id"],
-            resource_id=doc["resource_id"],
-            expiration_ms=doc.get("expiration_ms"),
-            created_at=doc.get("created_at"),
-            updated_at=doc.get("updated_at"),
-        )
 
-    def update_token(self, *, start_page_token: str) -> None:
+        # Em casos raros, pode voltar None dependendo de driver/config.
+        # Garantimos buscando de novo.
+        if not doc:
+            doc = await self.col.find_one({"_id": self.key})
+            if not doc:
+                raise RuntimeError("Falha ao upsert_watch: documento não encontrado após upsert.")
+
+        return self._to_state(doc)
+
+    async def update_token(self, *, start_page_token: str) -> None:
         now = datetime.now(timezone.utc)
-        self.col.update_one(
+        await self.col.update_one(
             {"_id": self.key},
             {"$set": {"start_page_token": start_page_token, "updated_at": now}},
+            upsert=True,
         )
 
-    def clear(self) -> None:
-        self.col.delete_one({"_id": self.key})
+    async def clear(self) -> None:
+        await self.col.delete_one({"_id": self.key})
 
-    def as_dict(self) -> Optional[Dict[str, Any]]:
-        st = self.get()
+    async def as_dict(self) -> Optional[Dict[str, Any]]:
+        st = await self.get()
         return st.__dict__ if st else None

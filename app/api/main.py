@@ -52,7 +52,7 @@ import json
 from pathlib import Path
 
 print("PROJECT_ROOT:", PROJECT_ROOT)
-print("CRED:", os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+print("[drive] credentials loaded from env")
 
 from pathlib import Path
 import os
