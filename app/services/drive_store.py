@@ -24,6 +24,12 @@ async def ensure_drive_indexes() -> None:
 
 
 async def upsert_drive_file(file_doc: Dict) -> None:
+    """
+    Regras:
+    - mantém indexed_at intacto (quem setta é mark_indexed)
+    - se modified_time mudou -> status NEW, limpa error e indexed_at
+    - se não mudou -> só atualiza metadados/last_seen_at
+    """
     db = get_db()
     col = db[COLLECTION]
 
@@ -32,48 +38,39 @@ async def upsert_drive_file(file_doc: Dict) -> None:
     file_id = file_doc["id"]
     modified_time = file_doc.get("modifiedTime")
 
-    existing = await col.find_one({"file_id": file_id}, {"modified_time": 1, "status": 1})
+    existing = await col.find_one({"file_id": file_id}, {"modified_time": 1})
 
-    # Decide status SEM conflitar $setOnInsert
-    if not existing:
-        next_status = "NEW"
-        indexed_at = None
-        error = None
-    else:
-        if existing.get("modified_time") != modified_time:
-            next_status = "NEW"
-            indexed_at = None
-            error = None
-        else:
-            next_status = existing.get("status", "NEW")
-            indexed_at = None  # não mexe aqui (mantém do doc). vamos usar $set somente no que importa
-            error = None
-
-    update = {
-        "$set": {
-            "file_id": file_id,
-            "name": file_doc.get("name"),
-            "mime_type": file_doc.get("mimeType"),
-            "size": int(file_doc["size"]) if file_doc.get("size") else None,
-            "modified_time": modified_time,
-            "parent_folder_id": file_doc.get("parent_folder_id"),
-            "parent_folder_name": file_doc.get("parent_folder_name"),
-            "trashed": bool(file_doc.get("trashed", False)),
-            "last_seen_at": now_iso,
-            "updated_at": now_iso,
-            "status": next_status,
-        },
-        "$setOnInsert": {
-            "indexed_at": None,
-            "error": None,
-            "created_at": now_iso,
-        },
+    # base: sempre atualiza metadados
+    set_fields = {
+        "file_id": file_id,
+        "name": file_doc.get("name"),
+        "mime_type": file_doc.get("mimeType"),
+        "size": int(file_doc["size"]) if file_doc.get("size") else None,
+        "modified_time": modified_time,
+        "parent_folder_id": file_doc.get("parent_folder_id"),
+        "parent_folder_name": file_doc.get("parent_folder_name"),
+        "trashed": bool(file_doc.get("trashed", False)),
+        "last_seen_at": now_iso,
+        "updated_at": now_iso,
     }
 
-    # Se mudou, reset explícito de campos de index
+    set_on_insert = {
+        "status": "NEW",
+        "indexed_at": None,
+        "error": None,
+        "created_at": now_iso,
+    }
+
+    update = {
+        "$set": set_fields,
+        "$setOnInsert": set_on_insert,
+    }
+
+    # se mudou modified_time -> força reindex
     if existing and existing.get("modified_time") != modified_time:
-        update["$set"]["indexed_at"] = None
+        update["$set"]["status"] = "NEW"
         update["$set"]["error"] = None
+        update["$set"]["indexed_at"] = None  # <-- aqui é OK, só no $set (não no $setOnInsert)
 
     await col.update_one({"file_id": file_id}, update, upsert=True)
 
