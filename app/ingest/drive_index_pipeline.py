@@ -9,6 +9,8 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
+from mistralai import Mistral
+
 from app.services.drive_store import list_new_files, mark_indexed, mark_error
 from app.ingest.qdrant_indexer import (
     get_qdrant,
@@ -21,7 +23,14 @@ from app.drive.sheets import SheetsValuesClient
 from app.services.sheet_snapshot_store import upsert_sheet_snapshot
 
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "drive_rag")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+# Mistral embeddings
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+MISTRAL_EMBED_MODEL = os.getenv("MISTRAL_EMBED_MODEL", "mistral-embed")
+MISTRAL_EMBED_BATCH = int(os.getenv("MISTRAL_EMBED_BATCH", "96"))
+
+# limite de caracteres por chunk antes de embed (evita estourar tokens)
+EMBED_TEXT_MAX_CHARS = int(os.getenv("EMBED_TEXT_MAX_CHARS", "12000"))
 
 # chunking default (texto geral)
 CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "1200"))
@@ -31,26 +40,56 @@ CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "150"))
 SHEET_ROWS_PER_CHUNK = int(os.getenv("SHEET_ROWS_PER_CHUNK", "60"))
 SHEET_MAX_COLS = int(os.getenv("SHEET_MAX_COLS", "60"))
 
-_model = None
+_mistral_client: Optional[Mistral] = None
 
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _get_model():
-    global _model
-    if _model is not None:
-        return _model
-    from sentence_transformers import SentenceTransformer
+def _get_mistral() -> Mistral:
+    global _mistral_client
+    if _mistral_client is not None:
+        return _mistral_client
 
-    _model = SentenceTransformer(EMBED_MODEL)
-    return _model
+    if not MISTRAL_API_KEY:
+        raise RuntimeError("MISTRAL_API_KEY não configurado")
+
+    _mistral_client = Mistral(api_key=MISTRAL_API_KEY)
+    return _mistral_client
+
+
+def _truncate_for_embedding(text: str) -> str:
+    if not text:
+        return text
+    if len(text) <= EMBED_TEXT_MAX_CHARS:
+        return text
+    return text[:EMBED_TEXT_MAX_CHARS]
 
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
-    model = _get_model()
-    return model.encode(texts, normalize_embeddings=True).tolist()
+    """
+    Embeddings via Mistral (leve pro Heroku, sem torch/cuda).
+    Faz batching pra evitar payload gigante.
+    """
+    client = _get_mistral()
+    out: List[List[float]] = []
+
+    clean = [_truncate_for_embedding(t or "") for t in texts]
+
+    for i in range(0, len(clean), MISTRAL_EMBED_BATCH):
+        batch = clean[i : i + MISTRAL_EMBED_BATCH]
+
+        # SDK Mistral: embeddings.create(model=..., inputs=[...])
+        resp = client.embeddings.create(
+            model=MISTRAL_EMBED_MODEL,
+            inputs=batch,
+        )
+
+        # resp.data -> lista com .embedding
+        out.extend([d.embedding for d in resp.data])
+
+    return out
 
 
 def _sha1(s: str) -> str:
@@ -98,9 +137,7 @@ GOOGLE_FOLDER = "application/vnd.google-apps.folder"
 EXPORT_MAP = {
     GOOGLE_DOC: ("text/plain", "txt"),
     GOOGLE_SLIDE: ("text/plain", "txt"),
-    # ⚠️ Sheets NÃO usamos export pra valores (usamos Sheets API)
-    # Mantém export xlsx apenas se tu quiser baixar binário por algum motivo:
-    # GOOGLE_SHEET: ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"),
+    # Sheets: não usamos export pra valores (usamos Sheets API)
 }
 
 BINARY_SUPPORTED = {
@@ -121,6 +158,7 @@ def _extract_text_from_bytes(data: bytes, mime_type: str) -> str:
     if mime_type == "application/pdf":
         try:
             from pypdf import PdfReader
+
             reader = PdfReader(io.BytesIO(data))
             pages = []
             for p in reader.pages:
@@ -133,6 +171,7 @@ def _extract_text_from_bytes(data: bytes, mime_type: str) -> str:
     if mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
         try:
             import docx  # python-docx
+
             d = docx.Document(io.BytesIO(data))
             return "\n".join([p.text for p in d.paragraphs if p.text])
         except Exception:
@@ -142,6 +181,7 @@ def _extract_text_from_bytes(data: bytes, mime_type: str) -> str:
     if mime_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
         try:
             import openpyxl
+
             wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
             out: List[str] = []
             for sheet in wb.worksheets:
@@ -212,7 +252,6 @@ def _rows_to_structured(values: List[List[Any]], *, max_cols: int = SHEET_MAX_CO
             obj[col] = v
 
             t = _infer_type(v)
-            # sobe schema (se algum valor existir, prioriza tipo não-null; se misturar, vira str)
             if schema[col] == "null" and t != "null":
                 schema[col] = t
             elif schema[col] != "null" and t != "null" and schema[col] != t:
@@ -246,20 +285,18 @@ def _sheet_rows_to_chunks_text(
     def fmt(v: Any) -> str:
         if v is None:
             return ""
-        # evita notação científica vindo do Sheets: normalmente já vem float “ok”
         if isinstance(v, float):
             s = f"{v:.10f}".rstrip("0").rstrip(".")
             return s
         return str(v).strip()
 
     for i in range(0, len(rows), rows_per_chunk):
-        block = rows[i:i + rows_per_chunk]
+        block = rows[i : i + rows_per_chunk]
         lines: List[str] = []
         lines.append(f"## Sheet: {sheet_name}")
         lines.append("HEADER: " + " | ".join([h for h in header if h]))
         lines.append("ROWS:")
         for j, r in enumerate(block):
-            # mostra “linha” compacta com colunas preenchidas
             parts = []
             for col in header:
                 val = fmt(r.get(col))
@@ -347,6 +384,7 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
     failed: List[str] = []
 
     totals = {"files": len(docs), "points": 0, "sheet_rows": 0, "sheet_tabs": 0}
+    collection_ready = False
 
     for doc in docs:
         file_id = doc.get("file_id")
@@ -358,7 +396,6 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
             failed.append(file_id or "?")
             continue
 
-        # pula pasta
         if mime_type == GOOGLE_FOLDER:
             await mark_indexed(file_id)
             indexed += 1
@@ -371,12 +408,10 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
             payload_base = _build_payload_base(doc)
 
             # ==========================================
-            # GOOGLE SHEETS (robusto, sem None)
+            # GOOGLE SHEETS (robusto, sem depender de fórmula)
             # ==========================================
             if mime_type == GOOGLE_SHEET:
                 sheet_names = sheets.list_sheets(file_id)
-
-                total_file_points = 0
 
                 for sheet_name in sheet_names:
                     values = sheets.get_values(file_id, sheet_name)
@@ -408,22 +443,22 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                     }
                     await upsert_sheet_snapshot(snapshot_doc)
 
-                    # chunks textuais para Qdrant
                     chunks = _sheet_rows_to_chunks_text(
                         sheet_name=sheet_name,
                         header=header,
                         rows=rows,
                         rows_per_chunk=SHEET_ROWS_PER_CHUNK,
                     )
-
                     if not chunks:
                         continue
 
                     texts = [t for (_rs, _re, t) in chunks]
                     vectors = _embed_texts(texts)
 
-                    vector_size = len(vectors[0])
-                    ensure_collection(qdrant, QDRANT_COLLECTION, vector_size)
+                    if not collection_ready:
+                        vector_size = len(vectors[0])
+                        ensure_collection(qdrant, QDRANT_COLLECTION, vector_size)
+                        collection_ready = True
 
                     points: List[Dict[str, Any]] = []
                     for idx, ((row_start, row_end, text), vec) in enumerate(zip(chunks, vectors)):
@@ -450,15 +485,13 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
 
                     upsert_points(qdrant, QDRANT_COLLECTION, points)
                     totals["points"] += len(points)
-                    total_file_points += len(points)
 
-                # terminou sheets
                 await mark_indexed(file_id)
                 indexed += 1
                 continue
 
             # ==========================================
-            # OUTROS (PDF/DOCX/TXT/...)
+            # OUTROS (PDF/DOCX/TXT/MD/XLSX uploadado)
             # ==========================================
             data, effective_mime = _download_or_export(drive, file_id, mime_type)
             text = _extract_text_from_bytes(data, effective_mime)
@@ -477,10 +510,13 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                 continue
 
             vectors = _embed_texts(chunks)
-            vector_size = len(vectors[0])
-            ensure_collection(qdrant, QDRANT_COLLECTION, vector_size)
 
-            points = []
+            if not collection_ready:
+                vector_size = len(vectors[0])
+                ensure_collection(qdrant, QDRANT_COLLECTION, vector_size)
+                collection_ready = True
+
+            points: List[Dict[str, Any]] = []
             for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
                 payload = dict(payload_base)
                 payload.update(
