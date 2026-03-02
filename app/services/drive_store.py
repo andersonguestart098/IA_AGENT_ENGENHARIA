@@ -32,6 +32,23 @@ async def upsert_drive_file(file_doc: Dict) -> None:
     file_id = file_doc["id"]
     modified_time = file_doc.get("modifiedTime")
 
+    existing = await col.find_one({"file_id": file_id}, {"modified_time": 1, "status": 1})
+
+    # Decide status SEM conflitar $setOnInsert
+    if not existing:
+        next_status = "NEW"
+        indexed_at = None
+        error = None
+    else:
+        if existing.get("modified_time") != modified_time:
+            next_status = "NEW"
+            indexed_at = None
+            error = None
+        else:
+            next_status = existing.get("status", "NEW")
+            indexed_at = None  # não mexe aqui (mantém do doc). vamos usar $set somente no que importa
+            error = None
+
     update = {
         "$set": {
             "file_id": file_id,
@@ -44,19 +61,17 @@ async def upsert_drive_file(file_doc: Dict) -> None:
             "trashed": bool(file_doc.get("trashed", False)),
             "last_seen_at": now_iso,
             "updated_at": now_iso,
+            "status": next_status,
         },
         "$setOnInsert": {
-            "status": "NEW",
             "indexed_at": None,
             "error": None,
             "created_at": now_iso,
         },
     }
 
-    # se mudou modified_time => volta status pra NEW (reindex)
-    existing = await col.find_one({"file_id": file_id}, {"modified_time": 1})
+    # Se mudou, reset explícito de campos de index
     if existing and existing.get("modified_time") != modified_time:
-        update["$set"]["status"] = "NEW"
         update["$set"]["indexed_at"] = None
         update["$set"]["error"] = None
 
