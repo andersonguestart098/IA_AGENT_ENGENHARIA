@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from pymongo import ASCENDING
 from app.core.mongo import get_db
@@ -26,9 +26,11 @@ async def ensure_drive_indexes() -> None:
 async def upsert_drive_file(file_doc: Dict) -> None:
     """
     Regras:
-    - mantém indexed_at intacto (quem setta é mark_indexed)
-    - se modified_time mudou -> status NEW, limpa error e indexed_at
-    - se não mudou -> só atualiza metadados/last_seen_at
+    - nunca duplica paths entre $set e $setOnInsert (evita code 40)
+    - status/indexed_at/error só mudam:
+        - no INSERT (status=NEW, indexed_at=None, error=None)
+        - quando modified_time muda (reindex -> status=NEW, indexed_at=None, error=None)
+    - se modified_time NÃO muda: só atualiza metadados/last_seen_at (não mexe em status/indexed_at)
     """
     db = get_db()
     col = db[COLLECTION]
@@ -40,7 +42,7 @@ async def upsert_drive_file(file_doc: Dict) -> None:
 
     existing = await col.find_one({"file_id": file_id}, {"modified_time": 1})
 
-    # base: sempre atualiza metadados
+    # Sempre atualiza metadados
     set_fields = {
         "file_id": file_id,
         "name": file_doc.get("name"),
@@ -54,23 +56,24 @@ async def upsert_drive_file(file_doc: Dict) -> None:
         "updated_at": now_iso,
     }
 
-    set_on_insert = {
-        "status": "NEW",
-        "indexed_at": None,
-        "error": None,
-        "created_at": now_iso,
-    }
-
     update = {
         "$set": set_fields,
-        "$setOnInsert": set_on_insert,
+        "$setOnInsert": {
+            "created_at": now_iso,
+        },
     }
 
-    # se mudou modified_time -> força reindex
-    if existing and existing.get("modified_time") != modified_time:
+    # INSERT
+    if not existing:
         update["$set"]["status"] = "NEW"
+        update["$set"]["indexed_at"] = None
         update["$set"]["error"] = None
-        update["$set"]["indexed_at"] = None  # <-- aqui é OK, só no $set (não no $setOnInsert)
+
+    # UPDATE com mudança => reindex
+    elif existing.get("modified_time") != modified_time:
+        update["$set"]["status"] = "NEW"
+        update["$set"]["indexed_at"] = None
+        update["$set"]["error"] = None
 
     await col.update_one({"file_id": file_id}, update, upsert=True)
 
@@ -89,10 +92,7 @@ async def mark_drive_file_deleted(file_id: str, reason: str = "removed") -> None
                 "error": reason,
                 "updated_at": now_iso,
             },
-            "$setOnInsert": {
-                "file_id": file_id,
-                "created_at": now_iso,
-            },
+            "$setOnInsert": {"created_at": now_iso},
         },
         upsert=True,
     )
