@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import json
 import uuid
@@ -12,7 +14,6 @@ from app.services.drive_state_store import DriveStateStore
 from app.drive.changes import DriveChangesClient
 from app.services.drive_store import upsert_drive_file, mark_drive_file_deleted
 from app.ingest.drive_index_pipeline import index_new_drive_files
-
 
 
 # ======================================================
@@ -43,14 +44,11 @@ def get_drive_state_store() -> DriveStateStore:
 # ======================================================
 
 redis_url = os.environ["REDIS_URL"]
-# Heroku normalmente fornece redis:// mesmo sendo TLS; troca para rediss://
 if redis_url.startswith("redis://"):
     redis_url = redis_url.replace("redis://", "rediss://", 1)
 
 
 class WorkerSettings:
-    # arq RedisSettings.from_dsn não aceita ssl=... em algumas versões,
-    # então fazemos parse e setamos ssl aqui.
     from urllib.parse import urlparse
 
     parsed = urlparse(redis_url)
@@ -60,7 +58,7 @@ class WorkerSettings:
         port=parsed.port or 6379,
         password=parsed.password,
         ssl=True,
-        ssl_cert_reqs="none",  # Heroku Redis: evita CERT_VERIFY_FAILED
+        ssl_cert_reqs="none",
     )
 
     functions = []
@@ -79,7 +77,7 @@ async def startup(ctx):
     ctx["drive"] = get_drive_client()
     ctx["store"] = get_drive_state_store()
 
-    # deixa redis disponível no ctx (pool do arq)
+    # pool do arq (isso retorna ArqRedis e tem enqueue_job)
     ctx["redis"] = await create_pool(WorkerSettings.redis_settings)
 
     print("[worker] startup ok")
@@ -99,10 +97,7 @@ async def shutdown(ctx):
 # ======================================================
 
 def _normalize_file_for_upsert(file_obj: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Garante que o documento tenha as chaves que o upsert usa.
-    Drive API usa "id"; changes usa "fileId".
-    """
+    # Drive API usa "id"; changes pode vir com "fileId"
     if "id" not in file_obj and "fileId" in file_obj:
         file_obj["id"] = file_obj["fileId"]
     return file_obj
@@ -113,10 +108,9 @@ async def _process_changes_only_ids(
     changes: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    - Se change.removed=True => marca DELETED (sem inventar doc fake)
-    - Se change.file vier => upsert usando esse objeto
-    - Se change.file NÃO vier => busca via drive.get_file_metadata(fileId)
-    - Preenche parent_folder_id e parent_folder_name (cache)
+    - removed=True -> marca deleted
+    - se não vier change.file -> busca por ID
+    - preenche parent_folder_id/name
     """
     upserted = 0
     deleted = 0
@@ -135,18 +129,15 @@ async def _process_changes_only_ids(
             continue
 
         try:
-            # 1) removido
             if removed:
                 await mark_drive_file_deleted(file_id, reason="removed")
                 deleted += 1
                 continue
 
-            # 2) pega objeto file (se veio), senão busca por id
             file_obj = ch.get("file")
             if not file_obj:
                 file_obj = drive.get_file_metadata(file_id)
                 if not file_obj:
-                    # sem acesso / 404/403 -> marca deleted soft
                     await mark_drive_file_deleted(file_id, reason="metadata_unavailable")
                     deleted += 1
                     continue
@@ -154,20 +145,19 @@ async def _process_changes_only_ids(
 
             file_obj = _normalize_file_for_upsert(file_obj)
 
-            # 3) se trashed, marca deleted
             if file_obj.get("trashed") is True:
                 await mark_drive_file_deleted(file_id, reason="trashed")
                 deleted += 1
                 continue
 
-            # 4) preenche parent_folder_id/name
             parents = file_obj.get("parents") or []
             parent_id = parents[0] if parents else None
 
-            parent_name = None
+            parent_name = ""
             if parent_id:
-                parent_name = folder_name_cache.get(parent_id)
-                if parent_name is None:
+                if parent_id in folder_name_cache:
+                    parent_name = folder_name_cache[parent_id]
+                else:
                     parent_name = drive.get_folder_name(parent_id) or ""
                     folder_name_cache[parent_id] = parent_name
 
@@ -190,13 +180,39 @@ async def _process_changes_only_ids(
 
 
 # ======================================================
+# JOB: INDEXAÇÃO (ARQ)
+# ======================================================
+
+async def index_new_files_job(ctx, payload: Optional[Dict[str, Any]] = None):
+    """
+    Job separado, pode ser disparado:
+    - manualmente
+    - após changes
+    - cron (se quiser)
+    """
+    redis = ctx["redis"]
+
+    got_lock = await redis.set("drive:indexing", "1", nx=True, ex=300)
+    if not got_lock:
+        print("[worker][index] already indexing, skipping")
+        return {"ok": False, "reason": "locked"}
+
+    try:
+        limit = int((payload or {}).get("limit", 25))
+        res = await index_new_drive_files(limit=limit)
+        print(f"[worker][index] {res}")
+        return res
+    finally:
+        await redis.delete("drive:indexing")
+
+
+# ======================================================
 # JOB: PROCESS CHANGES
 # ======================================================
 
 async def process_drive_changes(ctx, payload: Optional[Dict[str, Any]] = None):
     redis = ctx["redis"]
 
-    # 🔒 LOCK DISTRIBUÍDO SEGURO
     lock_id = str(uuid.uuid4())
     got_lock = await redis.set("drive:processing", lock_id, nx=True, ex=180)
 
@@ -217,21 +233,25 @@ async def process_drive_changes(ctx, payload: Optional[Dict[str, Any]] = None):
         n = len(changes or [])
         print(f"[worker] changes={n}")
 
-        # ✅ se não tem changes, só avança token e sai
+        # ✅ se não tem changes: só avança token e sai
         if n == 0:
             await store.update_token(start_page_token=new_start)
             return {"ok": True, "changes": 0, "skipped": "no_changes"}
 
-        # ✅ processa SOMENTE os IDs afetados (sem BFS)
+        # ✅ processa SOMENTE ids afetados
         stats = await _process_changes_only_ids(drive, changes)
 
         # atualiza token SEMPRE
         await store.update_token(start_page_token=new_start)
 
+        # ✅ AQUI fica o enqueue_job (depois de processar changes)
+        # Só dispara indexação se algo foi upsertado ou deletado.
+        if (stats.get("upserted", 0) > 0) or (stats.get("deleted", 0) > 0):
+            await redis.enqueue_job("index_new_files_job", {"source": "after_changes", "limit": 25})
+
         return {"ok": True, "changes": n, "stats": stats}
 
     finally:
-        # unlock seguro (não apaga lock alheio)
         current = await redis.get("drive:processing")
         if current and current.decode() == lock_id:
             await redis.delete("drive:processing")
@@ -285,29 +305,18 @@ async def renew_watch_if_needed(ctx):
 
     print("[worker][renew] renewed ok")
 
-    async def index_new_files_job(ctx, payload=None):
-        # lock separado (não conflita com o processamento de changes)
-        redis = ctx["redis"]
-        got_lock = await redis.set("drive:indexing", "1", nx=True, ex=180)
-        if not got_lock:
-            print("[worker][index] already indexing, skipping")
-            return {"ok": False, "reason": "locked"}
-
-        try:
-            res = await index_new_drive_files(limit=25)
-            print(f"[worker][index] {res}")
-            return res
-        finally:
-            await redis.delete("drive:indexing")
-
-
 # ======================================================
 # WORKER SETTINGS FINAL
 # ======================================================
 
-WorkerSettings.functions = [process_drive_changes]
+WorkerSettings.functions = [
+    process_drive_changes,
+    index_new_files_job
+]
+
 WorkerSettings.on_startup = startup
 WorkerSettings.on_shutdown = shutdown
+
 WorkerSettings.cron_jobs = [
     cron(renew_watch_if_needed, minute={0, 10, 20, 30, 40, 50}),
 ]

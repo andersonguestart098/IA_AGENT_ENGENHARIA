@@ -1,3 +1,4 @@
+# app/drive/changes.py
 from __future__ import annotations
 
 import os
@@ -12,7 +13,6 @@ SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 class DriveChangesClient:
     """
-    Client responsável por:
     - start_page_token
     - listagem de changes
     - watch (webhook)
@@ -36,11 +36,8 @@ class DriveChangesClient:
 
     def list_all_changes(self, start_page_token: str) -> Tuple[List[Dict[str, Any]], str]:
         """
-        Retorna:
-            (changes, new_start_page_token)
-        changes contém: fileId, file, removed
+        Retorna: (changes, new_start_page_token)
         """
-
         changes: List[Dict[str, Any]] = []
         page_token = start_page_token
         new_start_token = start_page_token
@@ -53,7 +50,13 @@ class DriveChangesClient:
                     spaces="drive",
                     includeItemsFromAllDrives=True,
                     supportsAllDrives=True,
-                    fields="nextPageToken,newStartPageToken,changes(fileId,file,removed)",
+                    # ✅ IMPORTANTE: subcampos do file explícitos
+                    fields=(
+                        "nextPageToken,newStartPageToken,"
+                        "changes(fileId,removed,file("
+                        "id,name,mimeType,modifiedTime,size,parents,trashed"
+                        "))"
+                    ),
                 )
                 .execute()
             )
@@ -71,9 +74,6 @@ class DriveChangesClient:
     # ======================================================
 
     def watch_changes(self, webhook_url: str, token: str, page_token: str) -> Dict[str, Any]:
-        """
-        Cria watch channel no Google Drive.
-        """
         body = {
             "id": f"drive-watch-{os.urandom(6).hex()}",
             "type": "web_hook",
@@ -94,18 +94,20 @@ class DriveChangesClient:
 
     def stop_channel(self, channel_id: str, resource_id: str) -> None:
         try:
-            self.service.channels().stop(body={"id": channel_id, "resourceId": resource_id}).execute()
+            self.service.channels().stop(
+                body={"id": channel_id, "resourceId": resource_id}
+            ).execute()
         except Exception as e:
             print(f"[drive][stop_channel] warn: {e}")
 
     # ======================================================
-    # FILE LOOKUP (🔥 PROCESSA SÓ IDs)
+    # FILE LOOKUP (PROCESSA SÓ IDs)
     # ======================================================
 
     def get_file_metadata(self, file_id: str) -> Optional[Dict[str, Any]]:
         """
-        Busca metadados completos do arquivo por ID.
-        Retorna None se não existir / sem permissão (404/403).
+        Busca metadados do arquivo por ID (rápido).
+        Retorna None se não existir/sem permissão.
         """
         try:
             return (
@@ -123,7 +125,7 @@ class DriveChangesClient:
 
     def get_folder_name(self, folder_id: str) -> Optional[str]:
         """
-        Busca nome da pasta pai (pra preencher parent_folder_name).
+        Busca nome de uma pasta (pra preencher parent_folder_name).
         """
         try:
             meta = (
