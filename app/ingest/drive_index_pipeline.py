@@ -16,6 +16,7 @@ from app.ingest.qdrant_indexer import get_qdrant, ensure_collection, upsert_poin
 from app.drive.changes import DriveChangesClient
 from app.services.sheet_snapshot_store import upsert_sheet_snapshot
 from app.ingest.xlsx_extractor import extract_xlsx_structured
+from app.ingest.qdrant_indexer import make_point_id
 
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "drive_rag")
 
@@ -332,11 +333,16 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                         }
                     )
 
+                    point_key = f"{file_id}:{sheet_name}:{sheet_sha1}:{idx}"
+
                     all_points.append(
                         {
-                            "id": f"{file_id}:{sheet_name}:{sheet_sha1}:{idx}",
+                            "id": make_point_id(point_key),  # ← UUID válido pro Qdrant
                             "vector": vec,
-                            "payload": payload,
+                            "payload": {
+                                **payload,
+                                "point_key": point_key,  # ← mantém rastreável humano
+                            },
                         }
                     )
 
