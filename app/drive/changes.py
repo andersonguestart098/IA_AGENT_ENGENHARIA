@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import io
+from googleapiclient.http import MediaIoBaseDownload
 from typing import Any, Dict, List, Optional, Tuple
 
 from google.oauth2 import service_account
@@ -141,3 +143,47 @@ class DriveChangesClient:
         except HttpError as e:
             print(f"[drive][get_folder_name] warn folder_id={folder_id} err={e}")
             return None
+
+
+    # ======================================================
+    # DOWNLOAD / EXPORT (para ingestão)
+    # ======================================================
+
+    def download_file_bytes(self, file_id: str) -> bytes:
+        """
+        Download de arquivos binários (PDF, DOCX, XLSX, etc.) via files.get_media.
+        """
+        try:
+            request = self.service.files().get_media(
+                fileId=file_id,
+                supportsAllDrives=True,
+            )
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024)  # 1MB
+            done = False
+            while not done:
+                _status, done = downloader.next_chunk()
+            return fh.getvalue()
+        except HttpError as e:
+            raise RuntimeError(f"drive download failed file_id={file_id}: {e}") from e
+
+    def export_file_bytes(self, file_id: str, export_mime: str) -> bytes:
+        """
+        Export de arquivos Google (Docs/Sheets/Slides) via files.export.
+        Ex: export_mime="text/plain" ou "text/csv".
+        """
+        try:
+            request = self.service.files().export(
+                fileId=file_id,
+                mimeType=export_mime,
+            )
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024)
+            done = False
+            while not done:
+                _status, done = downloader.next_chunk()
+            return fh.getvalue()
+        except HttpError as e:
+            raise RuntimeError(
+                f"drive export failed file_id={file_id} mime={export_mime}: {e}"
+            ) from e
