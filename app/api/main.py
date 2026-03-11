@@ -24,6 +24,7 @@ from app.services.drive_watch_service import ensure_watch_on_startup
 
 from app.drive.changes import DriveChangesClient
 from app.drive.scanner import scan_drive_incremental
+from app.services.sheet_diff_store import ensure_sheet_diff_indexes
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -31,10 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # local/dev
 load_dotenv(PROJECT_ROOT / ".env")
 
-
-# ====================================================
 # CONFIG
-# ====================================================
 
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 DRIVE_WEBHOOK_SECRET = os.environ.get("DRIVE_WEBHOOK_SECRET", "")
@@ -51,18 +49,12 @@ REDIS_URL = os.environ.get("REDIS_URL", "")
 if REDIS_URL.startswith("redis://"):
     REDIS_URL = REDIS_URL.replace("redis://", "rediss://", 1)
 
-
-# ====================================================
 # LOG HELPER
-# ====================================================
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
 
-
-# ====================================================
 # HELPERS
-# ====================================================
 
 def get_drive_client() -> DriveChangesClient:
     """
@@ -114,10 +106,7 @@ def get_redis_settings() -> RedisSettings:
         ssl_cert_reqs="none",
     )
 
-
-# ====================================================
 # POLLING (fallback)
-# ====================================================
 
 async def drive_scheduler(poll_seconds: int = 60):
     while True:
@@ -134,10 +123,7 @@ async def drive_scheduler(poll_seconds: int = 60):
 
         await asyncio.sleep(poll_seconds)
 
-
-# ====================================================
 # LIFESPAN
-# ====================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -151,6 +137,9 @@ async def lifespan(app: FastAPI):
 
     await ensure_drive_indexes()
     _log("[startup] drive indexes ok")
+
+    await ensure_sheet_diff_indexes()
+    _log("[startup] sheet diff indexes ok")
 
     app.state.drive_client = get_drive_client()
     app.state.drive_state_store = get_drive_state_store()
@@ -209,10 +198,7 @@ async def lifespan(app: FastAPI):
         _log("[shutdown] mongo closed")
         _log("[shutdown] complete")
 
-
-# ====================================================
 # APP
-# ====================================================
 
 def create_app() -> FastAPI:
     setup_logging()
@@ -225,6 +211,5 @@ def create_app() -> FastAPI:
 
     app.include_router(router)
     return app
-
 
 app = create_app()

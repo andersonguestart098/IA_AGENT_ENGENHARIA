@@ -2,36 +2,46 @@
 from __future__ import annotations
 
 import os
-import io
 import json
 import time
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 from mistralai import Mistral
 
 from app.services.drive_store import list_new_files, mark_indexed, mark_error
-from app.ingest.qdrant_indexer import get_qdrant, ensure_collection, upsert_points, delete_by_file_id
+from app.ingest.qdrant_indexer import (
+    get_qdrant,
+    ensure_collection,
+    upsert_points,
+    delete_by_file_id,
+    make_point_id,
+)
 from app.drive.changes import DriveChangesClient
 from app.services.sheet_snapshot_store import upsert_sheet_snapshot
+from app.services.sheet_diff_service import (
+    get_previous_snapshot,
+    diff_rows,
+    build_diff_summary,
+)
+from app.services.sheet_diff_store import insert_sheet_diff
 from app.ingest.xlsx_extractor import extract_xlsx_structured
-from app.ingest.qdrant_indexer import make_point_id
 
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "drive_rag")
 
-# Mistral embeddings (leve pro Heroku)
+# Mistral embeddings
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 MISTRAL_EMBED_MODEL = os.getenv("MISTRAL_EMBED_MODEL", "mistral-embed")
 MISTRAL_EMBED_BATCH = int(os.getenv("MISTRAL_EMBED_BATCH", "96"))
 EMBED_TEXT_MAX_CHARS = int(os.getenv("EMBED_TEXT_MAX_CHARS", "12000"))
 
-# Chunk planilha (linhas)
+# Chunk planilha
 SHEET_ROWS_PER_CHUNK = int(os.getenv("SHEET_ROWS_PER_CHUNK", "60"))
 SHEET_MAX_COLS = int(os.getenv("SHEET_MAX_COLS", "80"))
 
-# Segurança/limites
-MAX_ROWS_PER_SHEET = int(os.getenv("MAX_ROWS_PER_SHEET", "5000"))  # evita planilha gigante travar
+# Segurança / limites
+MAX_ROWS_PER_SHEET = int(os.getenv("MAX_ROWS_PER_SHEET", "5000"))
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 GOOGLE_FOLDER = "application/vnd.google-apps.folder"
@@ -40,7 +50,7 @@ _mistral_client: Optional[Mistral] = None
 
 
 def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.utcnow().isoformat() + "Z"
 
 
 def _sha1(s: str) -> str:
@@ -55,8 +65,10 @@ def _get_mistral() -> Mistral:
     global _mistral_client
     if _mistral_client is not None:
         return _mistral_client
+
     if not MISTRAL_API_KEY:
         raise RuntimeError("MISTRAL_API_KEY não configurado")
+
     _mistral_client = Mistral(api_key=MISTRAL_API_KEY)
     return _mistral_client
 
@@ -70,22 +82,18 @@ def _truncate_for_embedding(text: str) -> str:
 
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
-    """
-    Embedding via Mistral.
-    Logs por batch pra debugar latência/rate-limit.
-    """
     client = _get_mistral()
     out: List[List[float]] = []
 
     clean = [_truncate_for_embedding(t or "") for t in texts]
 
     for i in range(0, len(clean), MISTRAL_EMBED_BATCH):
-        batch = clean[i : i + MISTRAL_EMBED_BATCH]
+        batch = clean[i:i + MISTRAL_EMBED_BATCH]
         t0 = time.time()
         resp = client.embeddings.create(model=MISTRAL_EMBED_MODEL, inputs=batch)
         out.extend([d.embedding for d in resp.data])
         dt = time.time() - t0
-        print(f"[ingest][embed] batch={i//MISTRAL_EMBED_BATCH} size={len(batch)} dt={dt:.2f}s")
+        print(f"[ingest][embed] batch={i // MISTRAL_EMBED_BATCH} size={len(batch)} dt={dt:.2f}s")
 
     return out
 
@@ -144,7 +152,7 @@ def _sheet_rows_to_chunks_text(
     header = (header or [])[:SHEET_MAX_COLS]
 
     for i in range(0, len(rows), rows_per_chunk):
-        block = rows[i : i + rows_per_chunk]
+        block = rows[i:i + rows_per_chunk]
         lines: List[str] = []
 
         lines.append(f"## Sheet: {sheet_name}")
@@ -153,12 +161,12 @@ def _sheet_rows_to_chunks_text(
 
         for j, r in enumerate(block):
             parts = []
+
             for col in header:
                 val = _fmt(r.get(col))
                 if val != "":
                     parts.append(f"{col}={val}")
 
-            # rastreio opcional de fórmulas (se teu extractor preencher)
             for col in header:
                 f = r.get(f"__formula__{col}")
                 miss = r.get(f"__missing__{col}")
@@ -186,7 +194,13 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
     indexed = 0
     errors = 0
     failed: List[str] = []
-    totals = {"files": len(docs), "points": 0, "sheet_tabs": 0, "sheet_rows": 0}
+    totals = {
+        "files": len(docs),
+        "points": 0,
+        "sheet_tabs": 0,
+        "sheet_rows": 0,
+        "diffs": 0,
+    }
 
     collection_ready = False
 
@@ -205,14 +219,12 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
 
         print(f"[ingest][file] start file_id={file_id} name={name} mime={mime_type}")
 
-        # ignora pasta
         if mime_type == GOOGLE_FOLDER:
             await mark_indexed(file_id)
             indexed += 1
             print(f"[ingest][file] skip folder -> indexed file_id={file_id}")
             continue
 
-        # pipeline focada em XLSX
         if mime_type != XLSX_MIME:
             await mark_error(file_id, f"unsupported mime for xlsx-only pipeline: {mime_type}")
             errors += 1
@@ -221,20 +233,20 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
             continue
 
         try:
-            # delete seguro (pode falhar se coleção não existe ainda)
             try:
                 delete_by_file_id(qdrant, QDRANT_COLLECTION, file_id)
                 print(f"[ingest][qdrant] deleted existing points file_id={file_id}")
             except Exception as e:
                 print(f"[ingest][qdrant] delete skipped file_id={file_id} err={type(e).__name__}:{e}")
 
-            # download do arquivo (bytes)
             t0 = time.time()
             data = drive.download_file_bytes(file_id=file_id)
             dt = time.time() - t0
-            print(f"[ingest][download] ok file_id={file_id} bytes={len(data)} sha256={_sha256_bytes(data)[:12]} dt={dt:.2f}s")
+            print(
+                f"[ingest][download] ok file_id={file_id} "
+                f"bytes={len(data)} sha256={_sha256_bytes(data)[:12]} dt={dt:.2f}s"
+            )
 
-            # extrai estruturado
             t0 = time.time()
             extracted = extract_xlsx_structured(
                 data,
@@ -245,7 +257,11 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
 
             file_sha256 = extracted.get("file_sha256")
             sheets = extracted.get("sheets") or []
-            print(f"[ingest][extract] ok file_id={file_id} sheets={len(sheets)} file_sha256={str(file_sha256)[:12]} dt={dt:.2f}s")
+
+            print(
+                f"[ingest][extract] ok file_id={file_id} "
+                f"sheets={len(sheets)} file_sha256={str(file_sha256)[:12]} dt={dt:.2f}s"
+            )
 
             if not sheets:
                 await mark_error(file_id, "xlsx has no readable sheets/rows")
@@ -271,7 +287,12 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
 
                 print(f"[ingest][sheet] name={sheet_name} rows={len(rows)} sha1={str(sheet_sha1)[:10]}")
 
-                # snapshot determinístico no Mongo
+                previous_snapshot = await get_previous_snapshot(
+                    file_id=file_id,
+                    sheet=sheet_name,
+                    current_sheet_sha1=sheet_sha1,
+                )
+
                 snapshot_doc = {
                     "file_id": file_id,
                     "file_name": name,
@@ -288,33 +309,75 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                     "schema": schema,
                     "indexed_at": _utc_iso(),
                 }
-                await upsert_sheet_snapshot(snapshot_doc)
-                print(f"[ingest][mongo] snapshot upserted file_id={file_id} sheet={sheet_name}")
 
-                # chunks semânticos por bloco de linhas
+                await upsert_sheet_snapshot(snapshot_doc)
+                print(
+                    f"[ingest][mongo] snapshot upserted "
+                    f"file_id={file_id} file_name={name} sheet={sheet_name} rows={len(rows)}"
+                )
+
+                if previous_snapshot:
+                    diff = diff_rows(
+                        previous_rows=previous_snapshot.get("rows") or [],
+                        current_rows=rows,
+                    )
+
+                    if diff["added_count"] > 0 or diff["removed_count"] > 0:
+                        summary = build_diff_summary(
+                            file_name=name,
+                            sheet=sheet_name,
+                            diff=diff,
+                        )
+
+                        await insert_sheet_diff(
+                            {
+                                "file_id": file_id,
+                                "file_name": name,
+                                "sheet": sheet_name,
+                                "previous_sheet_sha1": previous_snapshot.get("sheet_sha1"),
+                                "current_sheet_sha1": sheet_sha1,
+                                "added_count": diff["added_count"],
+                                "removed_count": diff["removed_count"],
+                                "added_rows": diff["added_rows"],
+                                "removed_rows": diff["removed_rows"],
+                                "summary": summary,
+                                "modified_time": doc.get("modified_time"),
+                                "parent_folder_name": doc.get("parent_folder_name"),
+                            }
+                        )
+
+                        totals["diffs"] += 1
+
+                        print(
+                            f"[ingest][diff] file_id={file_id} sheet={sheet_name} "
+                            f"added={diff['added_count']} removed={diff['removed_count']}"
+                        )
+                        print(f"[ingest][diff][summary] {summary}")
+                    else:
+                        print(f"[ingest][diff] no row-level changes file_id={file_id} sheet={sheet_name}")
+                else:
+                    print(f"[ingest][diff] no previous snapshot file_id={file_id} sheet={sheet_name}")
+
                 chunks = _sheet_rows_to_chunks_text(
                     sheet_name=sheet_name,
                     header=header,
                     rows=rows,
                     rows_per_chunk=SHEET_ROWS_PER_CHUNK,
                 )
+
                 if not chunks:
                     print(f"[ingest][sheet] no chunks produced sheet={sheet_name}")
                     continue
 
                 texts = [t for (_rs, _re, t) in chunks]
-
-                # embedding
                 vectors = _embed_texts(texts)
 
-                # cria coleção na primeira vez que tiver vetor
                 if not collection_ready:
                     vector_size = len(vectors[0])
                     ensure_collection(qdrant, QDRANT_COLLECTION, vector_size)
                     collection_ready = True
                     print(f"[ingest][qdrant] ensure_collection ok name={QDRANT_COLLECTION} size={vector_size}")
 
-                # points
                 for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
                     row_start, row_end, text = chunk
 
@@ -337,11 +400,11 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
 
                     all_points.append(
                         {
-                            "id": make_point_id(point_key),  # ← UUID válido pro Qdrant
+                            "id": make_point_id(point_key),
                             "vector": vec,
                             "payload": {
                                 **payload,
-                                "point_key": point_key,  # ← mantém rastreável humano
+                                "point_key": point_key,
                             },
                         }
                     )
@@ -353,11 +416,11 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                 print(f"[ingest][file] no points -> error file_id={file_id}")
                 continue
 
-            # upsert batch
             t0 = time.time()
             upsert_points(qdrant, QDRANT_COLLECTION, all_points)
             dt = time.time() - t0
             totals["points"] += len(all_points)
+
             print(f"[ingest][qdrant] upsert ok file_id={file_id} points={len(all_points)} dt={dt:.2f}s")
 
             await mark_indexed(file_id)
@@ -378,5 +441,6 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
         "total_points": totals["points"],
         "sheet_tabs": totals["sheet_tabs"],
         "sheet_rows": totals["sheet_rows"],
+        "diffs_created": totals["diffs"],
         "failed": failed[:20],
     }
