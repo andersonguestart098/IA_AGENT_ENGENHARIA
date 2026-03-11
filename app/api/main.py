@@ -6,9 +6,11 @@ import asyncio
 import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi import FastAPI
 from dotenv import load_dotenv
+from arq.connections import RedisSettings, create_pool
 
 from app.api.routes import router
 from app.core.logging import setup_logging
@@ -44,6 +46,10 @@ DRIVE_USE_POLLING = os.environ.get("DRIVE_USE_POLLING", "true").lower() in (
 )
 
 DRIVE_POLL_SECONDS = int(os.environ.get("DRIVE_POLL_SECONDS", "60"))
+
+REDIS_URL = os.environ.get("REDIS_URL", "")
+if REDIS_URL.startswith("redis://"):
+    REDIS_URL = REDIS_URL.replace("redis://", "rediss://", 1)
 
 
 # ====================================================
@@ -94,6 +100,21 @@ def get_drive_state_store() -> DriveStateStore:
     return DriveStateStore(db["drive_state"])
 
 
+def get_redis_settings() -> RedisSettings:
+    if not REDIS_URL:
+        raise RuntimeError("REDIS_URL não configurado")
+
+    parsed = urlparse(REDIS_URL)
+
+    return RedisSettings(
+        host=parsed.hostname,
+        port=parsed.port or 6379,
+        password=parsed.password,
+        ssl=True,
+        ssl_cert_reqs="none",
+    )
+
+
 # ====================================================
 # POLLING (fallback)
 # ====================================================
@@ -115,46 +136,6 @@ async def drive_scheduler(poll_seconds: int = 60):
 
 
 # ====================================================
-# EVENT-DRIVEN JOB
-# ====================================================
-
-async def sync_drive_changes_job(app: FastAPI):
-    """
-    Job async chamado pelo webhook.
-    Hoje reaproveita o scanner incremental.
-    """
-    _log("[sync_drive_changes_job] start")
-
-    store: DriveStateStore = app.state.drive_state_store
-    drive: DriveChangesClient = app.state.drive_client
-
-    state = await store.get()
-    if not state:
-        _log("[sync_drive_changes_job] no state")
-        return
-
-    _log(
-        f"[sync_drive_changes_job] state "
-        f"start_page_token={(state.start_page_token or '')[:12]}... "
-        f"channel_id={(state.channel_id or '')[:18]}... "
-        f"resource_id={(state.resource_id or '')[:18]}..."
-    )
-
-    changes, new_start = drive.list_all_changes(
-        start_page_token=state.start_page_token
-    )
-
-    if changes:
-        _log(f"[sync_drive_changes_job] changes={len(changes)} -> scanning incremental")
-        await scan_drive_incremental(GDRIVE_FOLDER_ID)
-    else:
-        _log("[sync_drive_changes_job] no changes")
-
-    await store.update_token(start_page_token=new_start)
-    _log(f"[sync_drive_changes_job] token updated new_start={(new_start or '')[:12]}...")
-
-
-# ====================================================
 # LIFESPAN
 # ====================================================
 
@@ -173,7 +154,19 @@ async def lifespan(app: FastAPI):
 
     app.state.drive_client = get_drive_client()
     app.state.drive_state_store = get_drive_state_store()
+    app.state.drive_webhook_secret = DRIVE_WEBHOOK_SECRET
+    app.state.public_base_url = PUBLIC_BASE_URL
+    app.state.drive_use_polling = DRIVE_USE_POLLING
+    app.state.drive_poll_seconds = DRIVE_POLL_SECONDS
     _log("[startup] drive client + drive state store ok")
+
+    # redis pool da API (pra enfileirar no worker)
+    try:
+        app.state.redis = await create_pool(get_redis_settings())
+        _log("[startup] redis pool ok")
+    except Exception:
+        app.state.redis = None
+        _log("[startup] redis pool erro:\n" + traceback.format_exc())
 
     if DRIVE_USE_POLLING:
         app.state.drive_task = asyncio.create_task(
@@ -207,6 +200,11 @@ async def lifespan(app: FastAPI):
                 pass
             _log("[shutdown] drive polling task cancelled")
 
+        redis = getattr(app.state, "redis", None)
+        if redis:
+            await redis.close()
+            _log("[shutdown] redis pool closed")
+
         close_mongo()
         _log("[shutdown] mongo closed")
         _log("[shutdown] complete")
@@ -224,153 +222,6 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
-
-    # ==========================================
-    # START / RESET WATCH (fallback/admin)
-    # ==========================================
-    @app.post("/drive/watch/start")
-    async def drive_watch_start():
-        _log("[watch_start] requested")
-
-        if not PUBLIC_BASE_URL:
-            raise HTTPException(500, "PUBLIC_BASE_URL não configurado")
-
-        if not DRIVE_WEBHOOK_SECRET:
-            raise HTTPException(500, "DRIVE_WEBHOOK_SECRET não configurado")
-
-        drive: DriveChangesClient = app.state.drive_client
-        store: DriveStateStore = app.state.drive_state_store
-
-        old = await store.get()
-
-        if old:
-            _log(
-                f"[watch_start] existing state "
-                f"channel_id={(old.channel_id or '')[:18]}... "
-                f"resource_id={(old.resource_id or '')[:18]}... "
-                f"start_page_token={(old.start_page_token or '')[:12]}... "
-                f"expiration_ms={old.expiration_ms}"
-            )
-
-        if old and old.channel_id and old.resource_id:
-            try:
-                drive.stop_channel(
-                    channel_id=old.channel_id,
-                    resource_id=old.resource_id,
-                )
-                _log("[watch_start] old channel stopped")
-            except Exception as e:
-                _log(f"[watch_start] warn stop_channel err={type(e).__name__}:{e}")
-
-        start_token = drive.get_start_page_token()
-        webhook_url = f"{PUBLIC_BASE_URL}/drive/webhook"
-
-        _log(f"[watch_start] creating watch webhook_url={webhook_url}")
-
-        resp = drive.watch_changes(
-            webhook_url=webhook_url,
-            token=DRIVE_WEBHOOK_SECRET,
-            page_token=start_token,
-        )
-
-        await store.upsert_watch(
-            start_page_token=start_token,
-            channel_id=resp["id"],
-            resource_id=resp["resourceId"],
-            expiration_ms=int(resp["expiration"]) if resp.get("expiration") else None,
-        )
-
-        _log(
-            f"[watch_start] ok "
-            f"channel_id={resp.get('id')} "
-            f"resource_id={resp.get('resourceId')} "
-            f"expiration={resp.get('expiration')} "
-            f"start_page_token={start_token}"
-        )
-
-        return {
-            "ok": True,
-            "start_page_token": start_token,
-            "watch": resp,
-        }
-
-    # ==========================================
-    # WEBHOOK
-    # ==========================================
-    @app.post("/drive/webhook")
-    async def drive_webhook(request: Request, bg: BackgroundTasks):
-        h = request.headers
-
-        channel_id = h.get("x-goog-channel-id")
-        resource_id = h.get("x-goog-resource-id")
-        token = h.get("x-goog-channel-token")
-        resource_state = h.get("x-goog-resource-state")
-        message_number = h.get("x-goog-message-number")
-        resource_uri = h.get("x-goog-resource-uri")
-
-        _log(
-            "[drive_webhook] received "
-            f"channel_id={channel_id} "
-            f"resource_id={resource_id} "
-            f"state={resource_state} "
-            f"msg={message_number} "
-            f"resource_uri={resource_uri}"
-        )
-
-        if token != DRIVE_WEBHOOK_SECRET:
-            _log("[drive_webhook] invalid token")
-            raise HTTPException(401, "invalid token")
-
-        store: DriveStateStore = app.state.drive_state_store
-        state = await store.get()
-
-        if not state:
-            _log("[drive_webhook] watch not initialized")
-            raise HTTPException(409, "watch not initialized")
-
-        if channel_id != state.channel_id or resource_id != state.resource_id:
-            _log(
-                "[drive_webhook] unknown channel "
-                f"expected_channel={state.channel_id} "
-                f"expected_resource={state.resource_id}"
-            )
-            raise HTTPException(409, "unknown channel")
-
-        bg.add_task(sync_drive_changes_job, app)
-        _log("[drive_webhook] sync job enqueued")
-
-        return {"ok": True}
-
-    # ==========================================
-    # HEALTH / DEBUG
-    # ==========================================
-    @app.get("/drive/health")
-    async def drive_health():
-        store: DriveStateStore = app.state.drive_state_store
-        state = await store.get()
-
-        if not state:
-            return {
-                "ok": False,
-                "watch_initialized": False,
-                "public_base_url": bool(PUBLIC_BASE_URL),
-                "webhook_secret": bool(DRIVE_WEBHOOK_SECRET),
-                "polling": DRIVE_USE_POLLING,
-                "poll_seconds": DRIVE_POLL_SECONDS,
-            }
-
-        return {
-            "ok": True,
-            "watch_initialized": True,
-            "channel_id": state.channel_id,
-            "resource_id": state.resource_id,
-            "start_page_token": state.start_page_token,
-            "expiration_ms": state.expiration_ms,
-            "public_base_url": bool(PUBLIC_BASE_URL),
-            "webhook_secret": bool(DRIVE_WEBHOOK_SECRET),
-            "polling": DRIVE_USE_POLLING,
-            "poll_seconds": DRIVE_POLL_SECONDS,
-        }
 
     app.include_router(router)
     return app
