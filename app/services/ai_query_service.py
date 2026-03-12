@@ -1,101 +1,90 @@
 from __future__ import annotations
 
-import re
-import unicodedata
-from typing import Dict, Optional
+from typing import Dict, Any
+
+from app.services.query_entities import extract_entities
+from app.services.query_router import classify_route
+from app.services.query_policy import apply_route_policy
+from app.services.query_handlers import (
+    handle_structured_total,
+    handle_structured_diff,
+    handle_structured_last,
+    handle_structured_list_costs,
+    handle_structured_insights,
+    handle_semantic_rag,
+    handle_clarify,
+)
 
 
-def _strip_accents(text: str) -> str:
-    return "".join(
-        c for c in unicodedata.normalize("NFD", text)
-        if unicodedata.category(c) != "Mn"
-    )
-
-
-def normalize_text(text: str) -> str:
-    text = text or ""
-    text = text.strip()
-    text = _strip_accents(text)
-    text = re.sub(r"\s+", " ", text)
-    return text.lower()
-
-
-def extract_entities(question: str) -> Dict[str, Optional[str]]:
+async def query_ai(question: str) -> Dict[str, Any]:
     """
-    Extrai contexto operacional da pergunta.
+    Orquestrador principal da consulta de IA.
 
-    Retorno:
-    {
-        "obra": "OBRA A" | None,
-        "folder": "CUSTOS" | "FATURAMENTO" | "ORCAMENTO" | None,
-        "file_name": "custos.xlsx" | "faturamento.xlsx" | "orcamento.xlsx" | None,
-        "period": "current" | None
-    }
+    Fluxo:
+    1. Extrai entidades da pergunta
+    2. Classifica a rota inicial
+    3. Aplica correções de policy com base no contexto e na disponibilidade de dados
+    4. Executa o handler correspondente
+    5. Retorna resposta padronizada
     """
-    q_raw = question or ""
-    q_norm = normalize_text(q_raw)
-    q_upper = q_raw.upper()
+    question = (question or "").strip()
 
-    entities: Dict[str, Optional[str]] = {
-        "obra": None,
-        "folder": None,
-        "file_name": None,
-        "period": None,
+    if not question:
+        return {
+            "answer": "A pergunta veio vazia. Informe a obra e o tipo de informação desejada.",
+            "status": "clarify",
+            "scope": {
+                "obra": None,
+                "folder": None,
+                "file_name": None,
+                "period": None,
+            },
+            "route": "clarify",
+            "route_confidence": 1.0,
+            "route_reason": "empty_question",
+            "policy_adjusted": False,
+            "metadata": {},
+        }
+
+    entities = extract_entities(question)
+    initial_plan = classify_route(question, entities)
+    final_plan = await apply_route_policy(question, entities, initial_plan)
+
+    route = final_plan.get("route", "clarify")
+
+    print(f"[ai][question] {question}")
+    print(f"[ai][entities] {entities}")
+    print(f"[ai][plan.initial] {initial_plan}")
+    print(f"[ai][plan.final] {final_plan}")
+
+    if route == "structured_total":
+        result = await handle_structured_total(question, entities, final_plan)
+
+    elif route == "structured_diff":
+        result = await handle_structured_diff(question, entities, final_plan)
+
+    elif route == "structured_last":
+        result = await handle_structured_last(question, entities, final_plan)
+
+    elif route == "structured_list_costs":
+        result = await handle_structured_list_costs(question, entities, final_plan)
+
+    elif route == "structured_insights":
+        result = await handle_structured_insights(question, entities, final_plan)
+
+    elif route == "semantic_rag":
+        result = await handle_semantic_rag(question, entities, final_plan)
+
+    else:
+        result = await handle_clarify(question, entities, final_plan)
+
+    return {
+        "answer": result.get("answer", "Não foi possível gerar uma resposta."),
+        "status": result.get("status", "ok"),
+        "scope": entities,
+        "route": route,
+        "route_confidence": final_plan.get("confidence"),
+        "route_reason": final_plan.get("reason"),
+        "policy_adjusted": final_plan.get("policy_adjusted", False),
+        "metadata": result.get("data", {}),
     }
-
-    # -----------------------------------------------------
-    # OBRA
-    # -----------------------------------------------------
-    obra_match = re.search(r"\bobra\s+([a-zA-Z0-9_-]+)\b", q_norm)
-    if obra_match:
-        obra_token = obra_match.group(1).upper()
-        entities["obra"] = f"OBRA {obra_token}"
-
-    # -----------------------------------------------------
-    # FOLDER / DOMÍNIO
-    # -----------------------------------------------------
-    if any(t in q_norm for t in ["custo", "custos", "gasto", "gastos", "despesa", "despesas"]):
-        entities["folder"] = "CUSTOS"
-
-    elif any(t in q_norm for t in ["faturamento", "faturado", "receita", "venda", "vendas"]):
-        entities["folder"] = "FATURAMENTO"
-
-    elif any(t in q_norm for t in ["orcamento", "orçamento", "previsto", "previsao", "previsão"]):
-        entities["folder"] = "ORCAMENTO"
-
-    # -----------------------------------------------------
-    # FILE NAME
-    # -----------------------------------------------------
-    if "CUSTOS.XLSX" in q_upper or "PLANILHA DE CUSTOS" in q_upper:
-        entities["file_name"] = "custos.xlsx"
-        if not entities["folder"]:
-            entities["folder"] = "CUSTOS"
-
-    elif "FATURAMENTO.XLSX" in q_upper or "PLANILHA DE FATURAMENTO" in q_upper:
-        entities["file_name"] = "faturamento.xlsx"
-        if not entities["folder"]:
-            entities["folder"] = "FATURAMENTO"
-
-    elif "ORCAMENTO.XLSX" in q_upper or "ORÇAMENTO.XLSX" in q_upper or "PLANILHA DE ORCAMENTO" in q_upper:
-        entities["file_name"] = "orcamento.xlsx"
-        if not entities["folder"]:
-            entities["folder"] = "ORCAMENTO"
-
-    # -----------------------------------------------------
-    # PERÍODO
-    # -----------------------------------------------------
-    if any(t in q_norm for t in [
-        "ate agora",
-        "até agora",
-        "ate o momento",
-        "até o momento",
-        "atualmente",
-        "hoje",
-        "ate hoje",
-        "até hoje",
-        "ja",
-        "já",
-    ]):
-        entities["period"] = "current"
-
-    return entities
