@@ -23,13 +23,12 @@ def normalize_text(text: str) -> str:
 def extract_entities(question: str) -> Dict[str, Optional[str]]:
     """
     Extrai contexto operacional da pergunta.
-
-    Retorno:
+    Retorna:
     {
         "obra": "OBRA A" | None,
         "folder": "CUSTOS" | "FATURAMENTO" | "ORCAMENTO" | None,
-        "file_name": "custos.xlsx" | "faturamento.xlsx" | "orcamento.xlsx" | None,
-        "period": "current" | None
+        "file_name": "custos.xlsx" | "faturamento.xlsx" | None,
+        "period": None | "current"
     }
     """
     q_raw = question or ""
@@ -45,6 +44,7 @@ def extract_entities(question: str) -> Dict[str, Optional[str]]:
 
     # -----------------------------------------------------
     # OBRA
+    # Ex.: "obra a", "obra f", "na obra 12", "obra alpha"
     # -----------------------------------------------------
     obra_match = re.search(r"\bobra\s+([a-zA-Z0-9_-]+)\b", q_norm)
     if obra_match:
