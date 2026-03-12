@@ -11,6 +11,7 @@ VALID_ROUTES = {
     "structured_last",
     "structured_list_costs",
     "structured_insights",
+    "structured_max_cost",
     "semantic_rag",
     "clarify",
 }
@@ -42,6 +43,29 @@ def classify_route(question: str, entities: Dict[str, Optional[str]]) -> Dict[st
             "route": "clarify",
             "confidence": 0.99,
             "reason": "empty_question",
+        }
+
+    # -----------------------------------------------------
+    # MAX / MAIOR CUSTO
+    # -----------------------------------------------------
+    if _contains_any(q, [
+        "maior custo",
+        "maior gasto",
+        "maior despesa",
+        "custo mais alto",
+        "gasto mais alto",
+        "despesa mais alta",
+        "qual foi o maior custo",
+        "qual o maior custo",
+        "qual foi a maior despesa",
+        "qual a maior despesa",
+        "qual o custo mais alto",
+        "qual o gasto mais alto",
+    ]):
+        return {
+            "route": "structured_max_cost",
+            "confidence": 0.95,
+            "reason": "max_cost_question",
         }
 
     # -----------------------------------------------------

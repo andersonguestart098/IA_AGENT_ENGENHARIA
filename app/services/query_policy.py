@@ -85,6 +85,24 @@ def _looks_like_cost_listing(question: str) -> bool:
     ])
 
 
+def _looks_like_max_cost(question: str) -> bool:
+    q = normalize_text(question)
+    return any(term in q for term in [
+        "maior custo",
+        "maior gasto",
+        "maior despesa",
+        "custo mais alto",
+        "gasto mais alto",
+        "despesa mais alta",
+        "qual foi o maior custo",
+        "qual o maior custo",
+        "qual foi a maior despesa",
+        "qual a maior despesa",
+        "qual o custo mais alto",
+        "qual o gasto mais alto",
+    ])
+
+
 async def apply_route_policy(
     question: str,
     entities: Dict[str, Optional[str]],
@@ -118,6 +136,19 @@ async def apply_route_policy(
         }
 
     # -----------------------------------------------------
+    # Se parece maior custo e existe snapshot, prioriza structured_max_cost
+    # -----------------------------------------------------
+    if _looks_like_max_cost(question) and has_snapshot:
+        return {
+            "route": "structured_max_cost",
+            "confidence": max(confidence, 0.97),
+            "reason": "policy_max_cost_with_snapshot",
+            "policy_adjusted": route != "structured_max_cost",
+            "has_snapshot": has_snapshot,
+            "has_diff": has_diff,
+        }
+
+    # -----------------------------------------------------
     # Se parece total e existe snapshot, prioriza structured_total
     # -----------------------------------------------------
     if _looks_like_numeric_aggregate(question) and has_snapshot:
@@ -144,8 +175,7 @@ async def apply_route_policy(
         }
 
     # -----------------------------------------------------
-    # Se pediu mudança, mas não há diff e há snapshot, ainda mantém diff
-    # handler responde humanamente
+    # Se pediu mudança, mantém diff
     # -----------------------------------------------------
     if route == "structured_diff":
         return {
@@ -157,9 +187,6 @@ async def apply_route_policy(
             "has_diff": has_diff,
         }
 
-    # -----------------------------------------------------
-    # Se semantic_rag mas não há snapshot, pode acabar em mensagem humana
-    # -----------------------------------------------------
     return {
         "route": route,
         "confidence": confidence,

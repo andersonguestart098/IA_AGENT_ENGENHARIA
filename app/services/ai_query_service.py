@@ -11,22 +11,13 @@ from app.services.query_handlers import (
     handle_structured_last,
     handle_structured_list_costs,
     handle_structured_insights,
+    handle_structured_max_cost,
     handle_semantic_rag,
     handle_clarify,
 )
 
 
 async def query_ai(question: str) -> Dict[str, Any]:
-    """
-    Orquestrador principal da consulta de IA.
-
-    Fluxo:
-    1. Extrai entidades da pergunta
-    2. Classifica a rota inicial
-    3. Aplica correções de policy com base no contexto e na disponibilidade de dados
-    4. Executa o handler correspondente
-    5. Retorna resposta padronizada
-    """
     question = (question or "").strip()
 
     if not question:
@@ -71,6 +62,9 @@ async def query_ai(question: str) -> Dict[str, Any]:
 
     elif route == "structured_insights":
         result = await handle_structured_insights(question, entities, final_plan)
+
+    elif route == "structured_max_cost":
+        result = await handle_structured_max_cost(question, entities, final_plan)
 
     elif route == "semantic_rag":
         result = await handle_semantic_rag(question, entities, final_plan)

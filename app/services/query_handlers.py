@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 from typing import Dict, Any, Optional, List, cast
 
 from mistralai import Mistral
@@ -80,7 +79,6 @@ def _to_float(value: Any) -> Optional[float]:
     if not s:
         return None
 
-    # tenta formato BR
     s = s.replace(".", "").replace(",", ".")
     try:
         return float(s)
@@ -382,6 +380,60 @@ async def handle_structured_list_costs(
         "data": {
             "items": items,
             "count": len(items),
+        },
+    }
+
+
+async def handle_structured_max_cost(
+    question: str,
+    scope: Dict[str, Optional[str]],
+    plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    snapshot = await get_latest_snapshot(scope)
+
+    if not snapshot:
+        return {
+            "answer": (
+                f"Ainda não encontrei dados de custos para a {scope.get('obra') or 'obra informada'}."
+            ),
+            "status": "no_data_for_scope",
+        }
+
+    rows = snapshot.get("rows") or []
+    valid_rows: List[Dict[str, Any]] = []
+
+    for r in rows:
+        v = _to_float(r.get("VLR_CUSTO"))
+        if v is not None:
+            valid_rows.append({
+                "DATA": r.get("DATA"),
+                "DESC_CUSTO": r.get("DESC_CUSTO"),
+                "VLR_CUSTO": v,
+            })
+
+    if not valid_rows:
+        return {
+            "answer": "Não encontrei valores válidos para identificar o maior custo.",
+            "status": "no_valid_values",
+        }
+
+    maior = max(valid_rows, key=lambda x: x["VLR_CUSTO"])
+
+    desc = str(maior.get("DESC_CUSTO") or "sem descrição").strip()
+    data = maior.get("DATA", "sem data")
+    valor = float(maior["VLR_CUSTO"])
+
+    return {
+        "answer": (
+            f"O maior custo lançado na {scope.get('obra') or 'obra'} foi "
+            f"{desc}, no valor de R$ {_format_money(valor)}, na data {data}."
+        ),
+        "status": "ok",
+        "data": {
+            "descricao": desc,
+            "valor": valor,
+            "formatted_valor": _format_money(valor),
+            "data": data,
         },
     }
 
