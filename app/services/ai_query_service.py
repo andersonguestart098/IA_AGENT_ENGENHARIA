@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Dict, Any, Optional, List, Tuple, cast
+from typing import Dict, Any, Optional, List, cast
 
 from mistralai import Mistral
+from qdrant_client.http import models as rest
 
 from app.core.mongo import get_db
 from app.ingest.qdrant_indexer import get_qdrant
@@ -12,6 +13,7 @@ from app.ingest.qdrant_indexer import get_qdrant
 
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
+MISTRAL_EMBED_MODEL = os.getenv("MISTRAL_EMBED_MODEL", "mistral-embed")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "drive_rag")
 
 client = Mistral(api_key=MISTRAL_API_KEY)
@@ -27,7 +29,18 @@ def detect_intent(question: str) -> str:
     if "mudou" in q or "alteração" in q or "alteracao" in q or "mudanca" in q:
         return "diff"
 
-    if "total" in q or "soma" in q:
+    if (
+        "total" in q
+        or "soma" in q
+        or "quanto" in q
+        or "custou" in q
+        or "deu de custo" in q
+        or "até agora" in q
+        or "ate agora" in q
+        or "já gastou" in q
+        or "ja gastou" in q
+        or "gasto atual" in q
+    ):
         return "total"
 
     if "último" in q or "ultimo" in q or "última" in q or "ultima" in q:
@@ -45,7 +58,7 @@ def extract_entity(question: str) -> Dict[str, Optional[str]]:
     Extrai contexto operacional da pergunta.
     Ex:
     'Na OBRA F, o que mudou na planilha de custos?'
-      -> obra='OBRA F', folder='CUSTOS'
+      -> obra='OBRA F', folder='CUSTOS', file_name='custos.xlsx'
     """
     q = question.upper()
 
@@ -58,10 +71,6 @@ def extract_entity(question: str) -> Dict[str, Optional[str]]:
     # ---------------------------------------------
     # OBRA
     # ---------------------------------------------
-    # Pega padrões como:
-    # OBRA F
-    # OBRA A
-    # OBRA 12
     m = re.search(r"\bOBRA\s+([A-Z0-9_-]+)\b", q)
     if m:
         scope["obra"] = f"OBRA {m.group(1)}"
@@ -176,7 +185,6 @@ def _pick_latest_added_row(diff: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not added:
         return None
 
-    # tenta usar a última linha do array
     return added[-1]
 
 
@@ -184,29 +192,65 @@ def _pick_latest_added_row(diff: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 # QDRANT SEARCH
 # =========================================================
 
-def search_qdrant(question: str, scope: Dict[str, Optional[str]]) -> List[str]:
-    """
-    Primeira versão simples:
-    - busca vetorial textual
-    - sem filtro de payload ainda
-    """
-    qdrant = get_qdrant()
+def embed_query(text: str) -> List[float]:
+    resp = client.embeddings.create(
+        model=MISTRAL_EMBED_MODEL,
+        inputs=[text],
+    )
+    return resp.data[0].embedding
 
-    # IMPORTANTE:
-    # teu qdrant_client pode não suportar query_text direto dependendo da versão.
-    # Se isso já estiver funcionando no teu ambiente, mantém.
-    # Caso contrário, depois a gente adapta para embedding da pergunta + search por vector.
-    results = qdrant.search(
+
+def _build_qdrant_filter(scope: Dict[str, Optional[str]]) -> Optional[rest.Filter]:
+    must: List[rest.FieldCondition] = []
+
+    if scope.get("obra"):
+        must.append(
+            rest.FieldCondition(
+                key="obra_name",
+                match=rest.MatchValue(value=scope["obra"]),
+            )
+        )
+
+    if scope.get("folder"):
+        must.append(
+            rest.FieldCondition(
+                key="parent_folder_name",
+                match=rest.MatchValue(value=scope["folder"]),
+            )
+        )
+
+    # no qdrant payload teu campo é "name", não "file_name"
+    if scope.get("file_name"):
+        must.append(
+            rest.FieldCondition(
+                key="name",
+                match=rest.MatchValue(value=scope["file_name"]),
+            )
+        )
+
+    if not must:
+        return None
+
+    return rest.Filter(must=must)
+
+
+def search_qdrant(question: str, scope: Dict[str, Optional[str]]) -> List[str]:
+    qdrant = get_qdrant()
+    query_vector = embed_query(question)
+    q_filter = _build_qdrant_filter(scope)
+
+    results = qdrant.query_points(
         collection_name=QDRANT_COLLECTION,
-        query_vector=None,
-        query_text=question,
+        query=query_vector,
+        query_filter=q_filter,
         limit=3,
     )
 
-    texts = []
+    texts: List[str] = []
+    points = getattr(results, "points", None) or []
 
-    for r in results:
-        payload = r.payload or {}
+    for p in points:
+        payload = getattr(p, "payload", None) or {}
         txt = payload.get("text", "")
         if txt:
             texts.append(txt)
@@ -332,7 +376,15 @@ async def query_ai(question: str) -> Dict[str, Any]:
     # -----------------------------------------------------
     # RAG FALLBACK
     # -----------------------------------------------------
-    contexts = search_qdrant(question, scope)
+    try:
+        contexts = search_qdrant(question, scope)
+    except Exception as e:
+        return {
+            "answer": f"Não consegui consultar o contexto vetorial agora: {type(e).__name__}: {e}",
+            "intent": intent,
+            "scope": scope,
+        }
+
     context_text = "\n\n".join(contexts)
 
     if not context_text.strip():
