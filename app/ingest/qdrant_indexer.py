@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
@@ -19,15 +19,27 @@ def get_qdrant() -> QdrantClient:
 
 
 def make_point_id(key: str) -> str:
-    # UUID determinístico (estável entre reindex)
     return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
 
 
+def _safe_create_payload_index(
+    client: QdrantClient,
+    collection: str,
+    field_name: str,
+    field_schema: rest.PayloadSchemaType,
+) -> None:
+    try:
+        client.create_payload_index(
+            collection_name=collection,
+            field_name=field_name,
+            field_schema=field_schema,
+        )
+        print(f"[qdrant] payload index ok field={field_name}")
+    except Exception as e:
+        print(f"[qdrant] payload index skip field={field_name} err={type(e).__name__}:{e}")
+
+
 def ensure_collection(client: QdrantClient, collection: str, vector_size: int) -> None:
-    """
-    - Cria coleção se não existir
-    - Garante payload indexes necessários pro pipeline (delete_by_file_id e buscas futuras)
-    """
     exists = True
     try:
         _ = client.get_collection(collection)
@@ -42,36 +54,27 @@ def ensure_collection(client: QdrantClient, collection: str, vector_size: int) -
                 distance=rest.Distance.COSINE,
             ),
         )
+        print(f"[qdrant] collection created name={collection} size={vector_size}")
 
-    # ✅ IMPORTANTÍSSIMO: índices de payload pra filtros
-    # file_id e parent_folder_id devem ser "keyword"
-    # (se tua Qdrant Cloud for antiga, esse método ainda funciona)
-    try:
-        client.create_payload_index(
-            collection_name=collection,
-            field_name="file_id",
+    keyword_fields = [
+        "file_id",
+        "parent_folder_id",
+        "parent_folder_name",
+        "obra_name",
+        "obra_folder_id",
+        "mime_type",
+        "name",
+        "sheet",
+        "doc_kind",
+    ]
+
+    for field in keyword_fields:
+        _safe_create_payload_index(
+            client=client,
+            collection=collection,
+            field_name=field,
             field_schema=rest.PayloadSchemaType.KEYWORD,
         )
-    except Exception:
-        pass
-
-    try:
-        client.create_payload_index(
-            collection_name=collection,
-            field_name="parent_folder_id",
-            field_schema=rest.PayloadSchemaType.KEYWORD,
-        )
-    except Exception:
-        pass
-
-    try:
-        client.create_payload_index(
-            collection_name=collection,
-            field_name="mime_type",
-            field_schema=rest.PayloadSchemaType.KEYWORD,
-        )
-    except Exception:
-        pass
 
 
 def upsert_points(client: QdrantClient, collection: str, points: List[Dict[str, Any]]) -> None:
@@ -92,10 +95,6 @@ def upsert_points(client: QdrantClient, collection: str, points: List[Dict[str, 
 
 
 def delete_by_file_id(client: QdrantClient, collection: str, file_id: str) -> None:
-    """
-    Remove todos os pontos do arquivo (reindex limpo).
-    Depende de payload ter 'file_id' + payload index criado.
-    """
     client.delete(
         collection_name=collection,
         points_selector=rest.FilterSelector(
