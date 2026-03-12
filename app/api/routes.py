@@ -11,6 +11,7 @@ from app.drive.client import list_files_in_folder
 from app.ingest.qdrant_indexer import get_qdrant
 from app.drive.changes import DriveChangesClient
 from app.services.drive_state_store import DriveStateStore
+from app.services.ai_query_service import query_ai
 
 
 router = APIRouter()
@@ -249,6 +250,18 @@ async def drive_health(request: Request):
         "redis": bool(getattr(app.state, "redis", None)),
     }
 
+@router.post("/ai/query")
+async def ai_query(payload: dict):
+
+    question = payload.get("question")
+
+    if not question:
+        raise HTTPException(400, "question missing")
+
+    res = await query_ai(question)
+
+    return res
+
 
 @router.get("/qdrant/ping")
 async def qdrant_ping():
@@ -258,3 +271,4 @@ async def qdrant_ping():
         return {"ok": True, "collections": [c.name for c in info.collections]}
     except Exception as e:
         raise HTTPException(500, f"qdrant ping failed: {e}")
+
