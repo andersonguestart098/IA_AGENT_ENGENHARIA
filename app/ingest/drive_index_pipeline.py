@@ -299,13 +299,24 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                 totals["sheet_tabs"] += 1
                 totals["sheet_rows"] += len(rows)
 
-                print(f"[ingest][sheet] name={sheet_name} rows={len(rows)} sha1={str(sheet_sha1)[:10]}")
+                print(
+                    f"[ingest][sheet] name={sheet_name} rows={len(rows)} "
+                    f"sha1={str(sheet_sha1)[:10]}"
+                )
 
                 previous_snapshot = await get_previous_snapshot(
                     file_id=file_id,
                     sheet=sheet_name,
                     current_sheet_sha1=sheet_sha1,
                 )
+
+                if previous_snapshot:
+                    print(
+                        f"[ingest][sheet] previous_snapshot_sha1="
+                        f"{str(previous_snapshot.get('sheet_sha1'))[:10]}"
+                    )
+                else:
+                    print(f"[ingest][sheet] previous_snapshot_sha1=None")
 
                 snapshot_doc = {
                     "file_id": file_id,
@@ -388,8 +399,23 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                     print(f"[ingest][sheet] no chunks produced sheet={sheet_name}")
                     continue
 
+                print(
+                    f"[ingest][sheet] chunks_produced={len(chunks)} "
+                    f"sheet={sheet_name} sheet_sha1={sheet_sha1}"
+                )
+
                 texts = [t for (_rs, _re, t) in chunks]
                 vectors = _embed_texts(texts)
+
+                if not vectors:
+                    print(f"[ingest][embed] no vectors returned sheet={sheet_name}")
+                    continue
+
+                if len(vectors) != len(chunks):
+                    raise RuntimeError(
+                        f"Quantidade de vetores diferente da quantidade de chunks: "
+                        f"chunks={len(chunks)} vectors={len(vectors)}"
+                    )
 
                 if not collection_ready:
                     vector_size = len(vectors[0])
@@ -399,6 +425,17 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
 
                 for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
                     row_start, row_end, text = chunk
+                    snapshot_ref = f"{file_id}:{sheet_name}:{sheet_sha1}"
+                    point_key = f"{file_id}:{sheet_name}:{sheet_sha1}:{idx}"
+                    chunk_sha1 = _sha1(text)
+
+                    print(
+                        f"[ingest][point] file_id={file_id} sheet={sheet_name} "
+                        f"chunk_index={idx} row_start={row_start} row_end={row_end} "
+                        f"sheet_sha1={sheet_sha1} chunk_sha1={chunk_sha1[:10]} "
+                        f"snapshot_ref={snapshot_ref}"
+                    )
+                    print(f"[ingest][point][preview] {text[:500]}")
 
                     payload = dict(payload_base)
                     payload.update(
@@ -409,13 +446,11 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                             "row_start": row_start,
                             "row_end": row_end,
                             "chunk_index": idx,
-                            "chunk_sha1": _sha1(text),
-                            "snapshot_ref": f"{file_id}:{sheet_name}:{sheet_sha1}",
+                            "chunk_sha1": chunk_sha1,
+                            "snapshot_ref": snapshot_ref,
                             "text": text,
                         }
                     )
-
-                    point_key = f"{file_id}:{sheet_name}:{sheet_sha1}:{idx}"
 
                     all_points.append(
                         {

@@ -79,23 +79,41 @@ def ensure_collection(client: QdrantClient, collection: str, vector_size: int) -
 
 def upsert_points(client: QdrantClient, collection: str, points: List[Dict[str, Any]]) -> None:
     if not points:
+        print("[qdrant] upsert skipped: no points")
         return
 
-    client.upsert(
-        collection_name=collection,
-        points=[
-            rest.PointStruct(
-                id=p["id"],
-                vector=p["vector"],
-                payload=p["payload"],
-            )
-            for p in points
-        ],
+    point_structs = [
+        rest.PointStruct(
+            id=p["id"],
+            vector=p["vector"],
+            payload=p["payload"],
+        )
+        for p in points
+    ]
+
+    preview_payload = points[0].get("payload", {}) if points else {}
+    print(
+        f"[qdrant] upsert start collection={collection} "
+        f"points={len(points)} "
+        f"file_id={preview_payload.get('file_id')} "
+        f"sheet={preview_payload.get('sheet')} "
+        f"sheet_sha1={preview_payload.get('sheet_sha1')} "
+        f"snapshot_ref={preview_payload.get('snapshot_ref')}"
     )
+
+    op_info = client.upsert(
+        collection_name=collection,
+        points=point_structs,
+        wait=True,
+    )
+
+    print(f"[qdrant] upsert done collection={collection} result={op_info}")
 
 
 def delete_by_file_id(client: QdrantClient, collection: str, file_id: str) -> None:
-    client.delete(
+    print(f"[qdrant] delete start collection={collection} file_id={file_id}")
+
+    op_info = client.delete(
         collection_name=collection,
         points_selector=rest.FilterSelector(
             filter=rest.Filter(
@@ -107,4 +125,7 @@ def delete_by_file_id(client: QdrantClient, collection: str, file_id: str) -> No
                 ]
             )
         ),
+        wait=True,
     )
+
+    print(f"[qdrant] delete done collection={collection} file_id={file_id} result={op_info}")
