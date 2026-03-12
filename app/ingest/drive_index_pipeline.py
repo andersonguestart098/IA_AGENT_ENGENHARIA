@@ -27,6 +27,7 @@ from app.services.sheet_diff_service import (
 )
 from app.services.sheet_diff_store import insert_sheet_diff
 from app.ingest.xlsx_extractor import extract_xlsx_structured
+from app.services.drive_hierarchy_service import resolve_obra_context
 
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "drive_rag")
 
@@ -270,8 +271,21 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                 print(f"[ingest][file] no sheets -> error file_id={file_id}")
                 continue
 
+            obra_ctx = await resolve_obra_context(
+                parent_folder_id=doc.get("parent_folder_id"),
+                parent_folder_name=doc.get("parent_folder_name"),
+            )
+
             payload_base = _build_payload_base(doc)
             payload_base["file_sha256"] = file_sha256
+            payload_base["obra_name"] = obra_ctx.get("obra_name")
+            payload_base["obra_folder_id"] = obra_ctx.get("obra_folder_id")
+
+            print(
+                f"[ingest][obra] file_id={file_id} "
+                f"obra_name={obra_ctx.get('obra_name')} "
+                f"obra_folder_id={obra_ctx.get('obra_folder_id')}"
+            )
 
             all_points: List[Dict[str, Any]] = []
 
@@ -299,6 +313,8 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                     "modified_time": doc.get("modified_time"),
                     "parent_folder_id": doc.get("parent_folder_id"),
                     "parent_folder_name": doc.get("parent_folder_name"),
+                    "obra_name": obra_ctx.get("obra_name"),
+                    "obra_folder_id": obra_ctx.get("obra_folder_id"),
                     "mime_type": mime_type,
                     "file_sha256": file_sha256,
                     "sheet": sheet_name,
@@ -343,6 +359,9 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                                 "summary": summary,
                                 "modified_time": doc.get("modified_time"),
                                 "parent_folder_name": doc.get("parent_folder_name"),
+                                "parent_folder_id": doc.get("parent_folder_id"),
+                                "obra_name": obra_ctx.get("obra_name"),
+                                "obra_folder_id": obra_ctx.get("obra_folder_id"),
                             }
                         )
 

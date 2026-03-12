@@ -97,17 +97,14 @@ def extract_entity(question: str) -> Dict[str, Optional[str]]:
 def _build_diff_filter(scope: Dict[str, Optional[str]]) -> Dict[str, Any]:
     flt: Dict[str, Any] = {}
 
+    if scope.get("obra"):
+        flt["obra_name"] = scope["obra"]
+
     if scope.get("folder"):
         flt["parent_folder_name"] = scope["folder"]
 
     if scope.get("file_name"):
         flt["file_name"] = scope["file_name"]
-
-    # no futuro: quando salvar "obra_name" no snapshot/diff, usar aqui
-    if scope.get("obra"):
-        # fallback temporário: tenta achar no file_name ou parent path futuro
-        # hoje teu diff ainda não tem obra_name explícito
-        pass
 
     return flt
 
@@ -115,15 +112,14 @@ def _build_diff_filter(scope: Dict[str, Optional[str]]) -> Dict[str, Any]:
 def _build_snapshot_filter(scope: Dict[str, Optional[str]]) -> Dict[str, Any]:
     flt: Dict[str, Any] = {}
 
+    if scope.get("obra"):
+        flt["obra_name"] = scope["obra"]
+
     if scope.get("folder"):
         flt["parent_folder_name"] = scope["folder"]
 
     if scope.get("file_name"):
         flt["file_name"] = scope["file_name"]
-
-    if scope.get("obra"):
-        # quando teu snapshot passar a salvar obra_name, filtra aqui
-        pass
 
     return flt
 

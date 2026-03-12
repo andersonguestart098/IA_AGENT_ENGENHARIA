@@ -27,6 +27,16 @@ async def ensure_sheet_diff_indexes() -> None:
         name="ix_current_sheet_sha1"
     )
 
+    await col.create_index(
+        [("obra_name", ASCENDING), ("parent_folder_name", ASCENDING), ("created_at", ASCENDING)],
+        name="ix_obra_folder_created"
+    )
+
+    await col.create_index(
+        [("file_name", ASCENDING), ("created_at", ASCENDING)],
+        name="ix_file_name_created"
+    )
+
 
 async def insert_sheet_diff(doc: Dict[str, Any]) -> None:
     db = get_db()
