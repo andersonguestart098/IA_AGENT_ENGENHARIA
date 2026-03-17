@@ -10,6 +10,7 @@ VALID_ROUTES = {
     "structured_diff",
     "structured_last",
     "structured_list_costs",
+    "structured_lookup_cost",
     "structured_insights",
     "structured_max_cost",
     "semantic_rag",
@@ -19,6 +20,38 @@ VALID_ROUTES = {
 
 def _contains_any(text: str, terms: list[str]) -> bool:
     return any(term in text for term in terms)
+
+
+def _looks_like_cost_lookup(question: str) -> bool:
+    q = normalize_text(question)
+
+    lookup_terms = [
+        "teve",
+        "tem",
+        "existe",
+        "existiu",
+        "ha",
+        "há",
+        "houve",
+        "algum",
+        "alguma",
+    ]
+
+    list_terms = [
+        "quais custos",
+        "quais sao os custos",
+        "quais são os custos",
+        "listar custos",
+        "liste os custos",
+        "mostre os custos",
+        "quais gastos",
+        "quais despesas",
+    ]
+
+    if _contains_any(q, list_terms):
+        return False
+
+    return _contains_any(q, lookup_terms)
 
 
 def classify_route(question: str, entities: Dict[str, Optional[str]]) -> Dict[str, Any]:
@@ -72,8 +105,16 @@ def classify_route(question: str, entities: Dict[str, Optional[str]]) -> Dict[st
     # INSIGHTS
     # -----------------------------------------------------
     if _contains_any(q, [
-        "insight", "insights", "analise", "análise", "resumo", "pontos principais",
-        "o que chama atencao", "o que chama atenção", "o que voce percebe", "o que você percebe"
+        "insight",
+        "insights",
+        "analise",
+        "análise",
+        "resumo",
+        "pontos principais",
+        "o que chama atencao",
+        "o que chama atenção",
+        "o que voce percebe",
+        "o que você percebe",
     ]):
         return {
             "route": "structured_insights",
@@ -85,8 +126,16 @@ def classify_route(question: str, entities: Dict[str, Optional[str]]) -> Dict[st
     # DIFF / MUDANÇA
     # -----------------------------------------------------
     if _contains_any(q, [
-        "mudou", "mudanca", "mudança", "alteracao", "alteração", "houve alteracao",
-        "houve alteração", "o que mudou", "teve mudanca", "teve mudança"
+        "mudou",
+        "mudanca",
+        "mudança",
+        "alteracao",
+        "alteração",
+        "houve alteracao",
+        "houve alteração",
+        "o que mudou",
+        "teve mudanca",
+        "teve mudança",
     ]):
         return {
             "route": "structured_diff",
@@ -98,8 +147,16 @@ def classify_route(question: str, entities: Dict[str, Optional[str]]) -> Dict[st
     # LAST / ÚLTIMO LANÇAMENTO
     # -----------------------------------------------------
     if _contains_any(q, [
-        "ultimo", "último", "ultima", "última", "mais recente", "ultimo lancamento",
-        "último lançamento", "ultimo registro", "último registro", "mais novo"
+        "ultimo",
+        "último",
+        "ultima",
+        "última",
+        "mais recente",
+        "ultimo lancamento",
+        "último lançamento",
+        "ultimo registro",
+        "último registro",
+        "mais novo",
     ]):
         return {
             "route": "structured_last",
@@ -136,6 +193,17 @@ def classify_route(question: str, entities: Dict[str, Optional[str]]) -> Dict[st
             "route": "structured_total",
             "confidence": 0.90,
             "reason": "aggregate_numeric_question",
+        }
+
+    # -----------------------------------------------------
+    # LOOKUP ESPECÍFICO DE CUSTO
+    # Ex.: "teve peão?", "tem diária?", "existe container?"
+    # -----------------------------------------------------
+    if _looks_like_cost_lookup(q):
+        return {
+            "route": "structured_lookup_cost",
+            "confidence": 0.91,
+            "reason": "specific_cost_lookup_question",
         }
 
     # -----------------------------------------------------

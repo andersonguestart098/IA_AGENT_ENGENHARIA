@@ -10,6 +10,7 @@ from app.services.query_handlers import (
     handle_structured_diff,
     handle_structured_last,
     handle_structured_list_costs,
+    handle_structured_lookup_cost,
     handle_structured_insights,
     handle_structured_max_cost,
     handle_semantic_rag,
@@ -60,6 +61,9 @@ async def query_ai(question: str) -> Dict[str, Any]:
 
     elif route == "structured_list_costs":
         result = await handle_structured_list_costs(question, entities, final_plan)
+
+    elif route == "structured_lookup_cost":
+        result = await handle_structured_lookup_cost(question, entities, final_plan)
 
     elif route == "structured_insights":
         result = await handle_structured_insights(question, entities, final_plan)
