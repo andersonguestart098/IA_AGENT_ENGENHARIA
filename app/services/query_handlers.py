@@ -180,9 +180,34 @@ def _tokenize_for_rerank(text: str) -> List[str]:
         "qual", "quais", "quanto", "quanta", "quero", "me", "mostra", "mostrar", "liste",
         "listar", "tem", "teve", "com", "para", "por", "um", "uma", "os", "as", "que",
         "foi", "sao", "são", "ate", "até", "agora", "obra", "planilha", "arquivo",
-        "custos", "custo", "dados",
+        "dados",
     }
     return [t for t in raw if len(t) >= 3 and t not in stopwords]
+
+
+def _infer_folder_from_question(question: str) -> Optional[str]:
+    q = (question or "").lower()
+
+    custos_terms = [
+        "custo", "custos", "gasto", "gastos", "despesa", "despesas",
+        "locacao", "locação", "aluguel", "diaria", "diária",
+        "material", "insumo", "servico", "serviço", "fornecedor",
+        "compra", "compras", "maior custo", "total de custos",
+    ]
+    faturamento_terms = [
+        "faturamento", "parcela", "parcelas", "pagamento",
+        "prev pgto", "previsao de pagamento", "previsão de pagamento",
+        "forma pgto", "forma de pagamento", "recebimento",
+        "recebimentos", "pago", "pagou", "pagamentos",
+    ]
+
+    if any(term in q for term in custos_terms):
+        return "custos"
+
+    if any(term in q for term in faturamento_terms):
+        return "faturamento"
+
+    return None
 
 
 def _keyword_overlap_score(question: str, hit: Dict[str, Any]) -> float:
@@ -204,7 +229,8 @@ def _keyword_overlap_score(question: str, hit: Dict[str, Any]) -> float:
         "locacao", "locação", "aluguel", "diaria", "diária",
         "concreto", "cimento", "ferragem", "aco", "aço",
         "eletrica", "elétrica", "hidraulica", "hidráulica",
-        "mão", "mao", "obra", "servico", "serviço",
+        "mão", "mao", "servico", "serviço", "fornecedor",
+        "parcela", "pagamento", "recebimento",
     }
 
     content_matches = 0
@@ -258,12 +284,13 @@ def _dedupe_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _rerank_hits(
     question: str,
     scope: Dict[str, Optional[str]],
-    hits: List[Dict[str, Any]]
+    hits: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     ranked: List[Dict[str, Any]] = []
 
     scope_obra = (scope.get("obra") or "").strip().lower()
     scope_folder = (scope.get("folder") or "").strip().lower()
+    inferred_folder = _infer_folder_from_question(question)
 
     for hit in hits:
         vector_score = float(hit.get("score", 0.0) or 0.0)
@@ -275,19 +302,22 @@ def _rerank_hits(
         hit_obra = str(hit.get("obra_name") or "").strip().lower()
         hit_folder = str(hit.get("folder_name") or "").strip().lower()
 
-        # bônus / penalidade por obra
         if scope_obra:
             if hit_obra == scope_obra:
                 obra_bonus = 0.20
             else:
                 obra_bonus = -0.08
 
-        # bônus / penalidade leve por pasta
         if scope_folder:
             if hit_folder == scope_folder:
-                folder_bonus = 0.08
+                folder_bonus += 0.08
             else:
-                folder_bonus = -0.03
+                folder_bonus += -0.03
+        elif inferred_folder:
+            if hit_folder == inferred_folder:
+                folder_bonus += 0.10
+            else:
+                folder_bonus += -0.04
 
         final_score = vector_score + keyword_bonus + obra_bonus + folder_bonus
 
@@ -298,6 +328,7 @@ def _rerank_hits(
                 "keyword_bonus": keyword_bonus,
                 "obra_bonus": obra_bonus,
                 "folder_bonus": folder_bonus,
+                "inferred_folder": inferred_folder,
                 "final_score": final_score,
             }
         )
@@ -431,6 +462,7 @@ def search_qdrant(question: str, scope: Dict[str, Optional[str]]) -> List[Dict[s
             f"keyword_bonus={hit['keyword_bonus']:.4f} "
             f"obra_bonus={hit.get('obra_bonus', 0.0):.4f} "
             f"folder_bonus={hit.get('folder_bonus', 0.0):.4f} "
+            f"inferred_folder={hit.get('inferred_folder')} "
             f"obra={hit.get('obra_name')} "
             f"folder={hit.get('folder_name')} "
             f"arquivo={hit.get('file_name')} "
@@ -457,6 +489,7 @@ def build_search_debug(question: str, scope: Dict[str, Optional[str]], hits: Lis
                 "keyword_bonus": h.get("keyword_bonus"),
                 "obra_bonus": h.get("obra_bonus"),
                 "folder_bonus": h.get("folder_bonus"),
+                "inferred_folder": h.get("inferred_folder"),
                 "obra_name": h.get("obra_name"),
                 "folder_name": h.get("folder_name"),
                 "file_name": h.get("file_name"),
@@ -465,7 +498,7 @@ def build_search_debug(question: str, scope: Dict[str, Optional[str]], hits: Lis
                 "row_end": h.get("row_end"),
                 "doc_type": h.get("doc_type"),
                 "semantic_keywords": h.get("semantic_keywords"),
-                "text_preview": (h.get("text_preview") or h.get("text") or "")[:500],
+                "text_preview": (h.get("text_preview") or h.get("text") or "")[:900],
             }
             for i, h in enumerate(hits)
         ],
@@ -482,6 +515,7 @@ def _build_context_text(hits: List[Dict[str, Any]], max_chars: int = SEMANTIC_CO
             f"final_score={hit.get('final_score', hit.get('score', 0.0)):.4f} | "
             f"vector_score={hit.get('vector_score', hit.get('score', 0.0)):.4f} | "
             f"obra={hit.get('obra_name')} | "
+            f"pasta={hit.get('folder_name')} | "
             f"arquivo={hit.get('file_name')} | "
             f"aba={hit.get('sheet')} | "
             f"linhas={hit.get('row_start')}..{hit.get('row_end')} | "
@@ -887,6 +921,9 @@ async def handle_semantic_rag(
                     "final_score": h.get("final_score"),
                     "vector_score": h.get("vector_score"),
                     "keyword_bonus": h.get("keyword_bonus"),
+                    "obra_bonus": h.get("obra_bonus"),
+                    "folder_bonus": h.get("folder_bonus"),
+                    "inferred_folder": h.get("inferred_folder"),
                     "file_name": h.get("file_name"),
                     "sheet": h.get("sheet"),
                     "obra_name": h.get("obra_name"),
