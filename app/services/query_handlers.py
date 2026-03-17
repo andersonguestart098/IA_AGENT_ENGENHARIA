@@ -79,6 +79,46 @@ def _build_snapshot_filter(scope: Dict[str, Optional[str]]) -> Dict[str, Any]:
     return flt
 
 
+def _infer_folder_from_question(question: str) -> Optional[str]:
+    q = _normalize_for_match(question)
+
+    custos_terms = [
+        "custo", "custos", "gasto", "gastos", "despesa", "despesas",
+        "locacao", "aluguel", "diaria",
+        "material", "insumo", "servico", "fornecedor",
+        "compra", "compras", "maior custo", "total de custos",
+    ]
+    faturamento_terms = [
+        "faturamento", "parcela", "parcelas", "pagamento",
+        "prev pgto", "previsao de pagamento",
+        "forma pgto", "forma de pagamento", "recebimento",
+        "recebimentos", "pago", "pagou", "pagamentos",
+        "vencimento", "vencer", "vence", "vencidos", "vencidas",
+    ]
+
+    if any(term in q for term in custos_terms):
+        return "custos"
+
+    if any(term in q for term in faturamento_terms):
+        return "faturamento"
+
+    return None
+
+
+def _resolve_effective_scope(
+    question: str,
+    scope: Dict[str, Optional[str]],
+) -> Dict[str, Optional[str]]:
+    effective_scope = dict(scope)
+
+    if not effective_scope.get("folder"):
+        inferred_folder = _infer_folder_from_question(question)
+        if inferred_folder:
+            effective_scope["folder"] = inferred_folder.upper()
+
+    return effective_scope
+
+
 async def get_latest_snapshot(scope: Dict[str, Optional[str]]) -> Optional[Dict[str, Any]]:
     db = get_db()
     flt = _build_snapshot_filter(scope)
@@ -196,31 +236,6 @@ def _tokenize_for_rerank(text: str) -> List[str]:
     return [t for t in raw if len(t) >= 3 and t not in stopwords]
 
 
-def _infer_folder_from_question(question: str) -> Optional[str]:
-    q = _normalize_for_match(question)
-
-    custos_terms = [
-        "custo", "custos", "gasto", "gastos", "despesa", "despesas",
-        "locacao", "aluguel", "diaria",
-        "material", "insumo", "servico", "fornecedor",
-        "compra", "compras", "maior custo", "total de custos",
-    ]
-    faturamento_terms = [
-        "faturamento", "parcela", "parcelas", "pagamento",
-        "prev pgto", "previsao de pagamento",
-        "forma pgto", "forma de pagamento", "recebimento",
-        "recebimentos", "pago", "pagou", "pagamentos",
-    ]
-
-    if any(term in q for term in custos_terms):
-        return "custos"
-
-    if any(term in q for term in faturamento_terms):
-        return "faturamento"
-
-    return None
-
-
 def _keyword_overlap_score(question: str, hit: Dict[str, Any]) -> float:
     q_tokens = set(_tokenize_for_rerank(question))
     if not q_tokens:
@@ -243,7 +258,7 @@ def _keyword_overlap_score(question: str, hit: Dict[str, Any]) -> float:
         "concreto", "cimento", "ferragem", "aco",
         "eletrica", "hidraulica",
         "mao", "servico", "fornecedor",
-        "parcela", "pagamento", "recebimento",
+        "parcela", "pagamento", "recebimento", "vencimento",
     }
 
     content_matches = 0
@@ -623,31 +638,110 @@ Regras:
     raise RuntimeError(f"LLM unavailable after retries: {type(last_error).__name__}: {last_error}")
 
 
+def _extract_lookup_term(question: str, scope: Dict[str, Optional[str]]) -> Optional[str]:
+    q = _normalize_for_match(question)
+
+    obra = _normalize_for_match(scope.get("obra") or "")
+    folder = _normalize_for_match(scope.get("folder") or "")
+    file_name = _normalize_for_match(scope.get("file_name") or "")
+
+    for piece in [obra, folder, file_name]:
+        if piece:
+            q = q.replace(piece, " ")
+
+    q = re.sub(r"\bobra\b", " ", q)
+
+    fillers = {
+        "teve", "tem", "existe", "existiu", "ha", "houve",
+        "algum", "alguma",
+        "custo", "custos", "gasto", "gastos", "despesa", "despesas",
+        "com", "na", "no", "da", "do", "de", "em", "para", "por",
+        "arquivo", "planilha", "pasta", "aba",
+        "qual", "quais", "mostrar", "mostre", "liste", "listar",
+    }
+
+    tokens = re.findall(r"[a-z0-9_]+", q)
+    tokens = [t for t in tokens if t not in fillers and len(t) >= 3]
+
+    if not tokens:
+        return None
+
+    priority_terms = [
+        "peao",
+        "diaria",
+        "container",
+        "locacao",
+        "aluguel",
+        "pagamento",
+        "parcela",
+        "recebimento",
+        "concreto",
+        "cimento",
+        "ferragem",
+        "material",
+        "fornecedor",
+        "servico",
+        "vencimento",
+    ]
+
+    for term in priority_terms:
+        if term in tokens:
+            return term
+
+    return tokens[-1]
+
+
+def _expand_lookup_terms(term: str) -> List[str]:
+    base = _normalize_for_match(term)
+
+    synonyms = {
+        "aluguel": ["aluguel", "locacao"],
+        "locacao": ["locacao", "aluguel"],
+        "diaria": ["diaria", "peao"],
+        "peao": ["peao", "diaria"],
+        "container": ["container"],
+        "pagamento": ["pagamento", "parcela", "recebimento"],
+        "parcela": ["parcela", "pagamento"],
+        "recebimento": ["recebimento", "pagamento", "parcela"],
+        "servico": ["servico", "mao", "peao", "diaria"],
+        "material": ["material", "insumo"],
+        "vencimento": ["vencimento", "prev", "prev_pgto", "prev pgto"],
+    }
+
+    return synonyms.get(base, [base])
+
+
 async def handle_structured_total(
     question: str,
     scope: Dict[str, Optional[str]],
     plan: Dict[str, Any],
 ) -> Dict[str, Any]:
-    snapshot = await get_latest_snapshot(scope)
+    effective_scope = _resolve_effective_scope(question, scope)
+    snapshot = await get_latest_snapshot(effective_scope)
 
     if not snapshot:
         return {
             "answer": (
-                f"Ainda não encontrei dados de {scope.get('folder', 'dados').lower()} "
-                f"para a {scope.get('obra') or 'obra informada'}. "
+                f"Ainda não encontrei dados de {str(effective_scope.get('folder') or 'dados').lower()} "
+                f"para a {effective_scope.get('obra') or 'obra informada'}. "
                 f"Pode ser que essa obra ainda não tenha planilha indexada ou sincronizada."
             ),
             "status": "no_data_for_scope",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "snapshot",
+            },
         }
 
     total = await calculate_total(snapshot)
 
     return {
-        "answer": f"O total atual de custos da {scope.get('obra') or 'obra'} é R$ {_format_money(total)}.",
+        "answer": f"O total atual de custos da {effective_scope.get('obra') or 'obra'} é R$ {_format_money(total)}.",
         "status": "ok",
         "data": {
             "total": total,
             "formatted_total": _format_money(total),
+            "effective_scope": effective_scope,
             "source": "snapshot",
         },
     }
@@ -658,15 +752,20 @@ async def handle_structured_diff(
     scope: Dict[str, Optional[str]],
     plan: Dict[str, Any],
 ) -> Dict[str, Any]:
-    diff = await get_last_diff(scope)
+    effective_scope = _resolve_effective_scope(question, scope)
+    diff = await get_last_diff(effective_scope)
 
     if not diff:
         return {
             "answer": (
-                f"Ainda não encontrei alterações registradas para a {scope.get('obra') or 'obra informada'} "
+                f"Ainda não encontrei alterações registradas para a {effective_scope.get('obra') or 'obra informada'} "
                 f"nesse contexto."
             ),
             "status": "no_diff_found",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "diff",
+            },
         }
 
     summary = diff.get("summary") or "Alteração identificada."
@@ -677,6 +776,7 @@ async def handle_structured_diff(
         "data": {
             "added_count": diff.get("added_count", 0),
             "removed_count": diff.get("removed_count", 0),
+            "effective_scope": effective_scope,
             "source": "diff",
         },
     }
@@ -687,7 +787,8 @@ async def handle_structured_last(
     scope: Dict[str, Optional[str]],
     plan: Dict[str, Any],
 ) -> Dict[str, Any]:
-    diff = await get_last_diff(scope)
+    effective_scope = _resolve_effective_scope(question, scope)
+    diff = await get_last_diff(effective_scope)
 
     if diff:
         row = _pick_latest_added_row(diff)
@@ -703,18 +804,23 @@ async def handle_structured_last(
                     "descricao": desc,
                     "valor": val,
                     "data": data,
+                    "effective_scope": effective_scope,
                     "source": "diff_added_row",
                 },
             }
 
-    snapshot = await get_latest_snapshot(scope)
+    snapshot = await get_latest_snapshot(effective_scope)
     if not snapshot:
         return {
             "answer": (
                 f"Ainda não encontrei dados suficientes para identificar o último lançamento "
-                f"da {scope.get('obra') or 'obra informada'}."
+                f"da {effective_scope.get('obra') or 'obra informada'}."
             ),
             "status": "no_data_for_scope",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "snapshot_last_row",
+            },
         }
 
     rows = snapshot.get("rows") or []
@@ -722,6 +828,10 @@ async def handle_structured_last(
         return {
             "answer": "Não encontrei linhas suficientes para identificar o último lançamento.",
             "status": "empty_snapshot",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "snapshot_last_row",
+            },
         }
 
     row = rows[-1]
@@ -736,6 +846,7 @@ async def handle_structured_last(
             "descricao": desc,
             "valor": val,
             "data": data,
+            "effective_scope": effective_scope,
             "source": "snapshot_last_row",
         },
     }
@@ -746,14 +857,19 @@ async def handle_structured_list_costs(
     scope: Dict[str, Optional[str]],
     plan: Dict[str, Any],
 ) -> Dict[str, Any]:
-    snapshot = await get_latest_snapshot(scope)
+    effective_scope = _resolve_effective_scope(question, scope)
+    snapshot = await get_latest_snapshot(effective_scope)
 
     if not snapshot:
         return {
             "answer": (
-                f"Ainda não encontrei dados de custos para a {scope.get('obra') or 'obra informada'}."
+                f"Ainda não encontrei dados de custos para a {effective_scope.get('obra') or 'obra informada'}."
             ),
             "status": "no_data_for_scope",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "snapshot",
+            },
         }
 
     rows = snapshot.get("rows") or []
@@ -761,6 +877,10 @@ async def handle_structured_list_costs(
         return {
             "answer": "A planilha foi encontrada, mas não há linhas de custos disponíveis.",
             "status": "empty_snapshot",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "snapshot",
+            },
         }
 
     lines: List[str] = []
@@ -782,7 +902,7 @@ async def handle_structured_list_costs(
         )
 
     answer = (
-        f"Os custos identificados para a {scope.get('obra') or 'obra'} são:\n"
+        f"Os custos identificados para a {effective_scope.get('obra') or 'obra'} são:\n"
         + "\n".join(lines[:50])
     )
 
@@ -792,6 +912,7 @@ async def handle_structured_list_costs(
         "data": {
             "items": items,
             "count": len(items),
+            "effective_scope": effective_scope,
             "source": "snapshot",
         },
     }
@@ -802,14 +923,19 @@ async def handle_structured_max_cost(
     scope: Dict[str, Optional[str]],
     plan: Dict[str, Any],
 ) -> Dict[str, Any]:
-    snapshot = await get_latest_snapshot(scope)
+    effective_scope = _resolve_effective_scope(question, scope)
+    snapshot = await get_latest_snapshot(effective_scope)
 
     if not snapshot:
         return {
             "answer": (
-                f"Ainda não encontrei dados de custos para a {scope.get('obra') or 'obra informada'}."
+                f"Ainda não encontrei dados de custos para a {effective_scope.get('obra') or 'obra informada'}."
             ),
             "status": "no_data_for_scope",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "snapshot_max",
+            },
         }
 
     rows = snapshot.get("rows") or []
@@ -830,6 +956,10 @@ async def handle_structured_max_cost(
         return {
             "answer": "Não encontrei valores válidos para identificar o maior custo.",
             "status": "no_valid_values",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "snapshot_max",
+            },
         }
 
     maior = max(valid_rows, key=lambda x: x["VLR_CUSTO"])
@@ -840,7 +970,7 @@ async def handle_structured_max_cost(
 
     return {
         "answer": (
-            f"O maior custo lançado na {scope.get('obra') or 'obra'} foi "
+            f"O maior custo lançado na {effective_scope.get('obra') or 'obra'} foi "
             f"{desc}, no valor de R$ {_format_money(valor)}, na data {data}."
         ),
         "status": "ok",
@@ -849,6 +979,7 @@ async def handle_structured_max_cost(
             "valor": valor,
             "formatted_valor": _format_money(valor),
             "data": data,
+            "effective_scope": effective_scope,
             "source": "snapshot_max",
         },
     }
@@ -859,15 +990,20 @@ async def handle_structured_insights(
     scope: Dict[str, Optional[str]],
     plan: Dict[str, Any],
 ) -> Dict[str, Any]:
-    snapshot = await get_latest_snapshot(scope)
+    effective_scope = _resolve_effective_scope(question, scope)
+    snapshot = await get_latest_snapshot(effective_scope)
 
     if not snapshot:
         return {
             "answer": (
                 f"Ainda não encontrei dados suficientes para gerar insights da "
-                f"{scope.get('obra') or 'obra informada'}."
+                f"{effective_scope.get('obra') or 'obra informada'}."
             ),
             "status": "no_data_for_scope",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "snapshot_insights",
+            },
         }
 
     rows = snapshot.get("rows") or []
@@ -888,6 +1024,10 @@ async def handle_structured_insights(
         return {
             "answer": "Não encontrei valores válidos para gerar insights.",
             "status": "no_valid_values",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "snapshot_insights",
+            },
         }
 
     total = sum(r["VLR_CUSTO"] for r in valid_rows)
@@ -917,6 +1057,7 @@ async def handle_structured_insights(
             "total": total,
             "maior_custo": maior,
             "recorrentes": recorrentes,
+            "effective_scope": effective_scope,
             "source": "snapshot_insights",
         },
     }
@@ -927,25 +1068,31 @@ async def handle_semantic_rag(
     scope: Dict[str, Optional[str]],
     plan: Dict[str, Any],
 ) -> Dict[str, Any]:
+    effective_scope = _resolve_effective_scope(question, scope)
+
     try:
-        hits = search_qdrant(question, scope)
+        hits = search_qdrant(question, effective_scope)
     except Exception as e:
         return {
             "answer": f"Não consegui consultar o contexto vetorial agora: {type(e).__name__}: {e}",
             "status": "vector_error",
+            "data": {
+                "effective_scope": effective_scope,
+            },
         }
 
     if not hits:
         return {
             "answer": (
-                f"Ainda não encontrei dados suficientes para a {scope.get('obra') or 'obra informada'} "
+                f"Ainda não encontrei dados suficientes para a {effective_scope.get('obra') or 'obra informada'} "
                 f"nesse contexto. Tente informar a obra, a pasta ou o nome do arquivo."
             ),
             "status": "insufficient_retrieval",
             "data": {
                 "contexts_found": 0,
                 "hits": [],
-                "search_debug": build_search_debug(question, scope, []),
+                "effective_scope": effective_scope,
+                "search_debug": build_search_debug(question, effective_scope, []),
             },
         }
 
@@ -955,13 +1102,14 @@ async def handle_semantic_rag(
         return {
             "answer": (
                 f"Encontrei registros vetoriais, mas sem contexto textual suficiente para responder "
-                f"com segurança sobre a {scope.get('obra') or 'obra informada'}."
+                f"com segurança sobre a {effective_scope.get('obra') or 'obra informada'}."
             ),
             "status": "insufficient_retrieval",
             "data": {
                 "contexts_found": len(hits),
                 "hits": hits,
-                "search_debug": build_search_debug(question, scope, hits),
+                "effective_scope": effective_scope,
+                "search_debug": build_search_debug(question, effective_scope, hits),
             },
         }
 
@@ -1005,84 +1153,13 @@ async def handle_semantic_rag(
                 }
                 for h in hits
             ],
-            "search_debug": build_search_debug(question, scope, hits),
+            "effective_scope": effective_scope,
+            "search_debug": build_search_debug(question, effective_scope, hits),
             "source": "qdrant_semantic",
             "llm_status": llm_status,
             "llm_error": llm_error,
         },
     }
-
-def _extract_lookup_term(question: str, scope: Dict[str, Optional[str]]) -> Optional[str]:
-    q = _normalize_for_match(question)
-
-    obra = _normalize_for_match(scope.get("obra") or "")
-    folder = _normalize_for_match(scope.get("folder") or "")
-    file_name = _normalize_for_match(scope.get("file_name") or "")
-
-    # remove contexto conhecido do escopo
-    for piece in [obra, folder, file_name]:
-        if piece:
-            q = q.replace(piece, " ")
-
-    # remove padrões tipo "obra xxx" que sobrarem
-    q = re.sub(r"\bobra\b", " ", q)
-
-    fillers = {
-        "teve", "tem", "existe", "existiu", "ha", "houve",
-        "algum", "alguma",
-        "custo", "custos", "gasto", "gastos", "despesa", "despesas",
-        "com", "na", "no", "da", "do", "de", "em", "para", "por",
-        "arquivo", "planilha", "pasta", "aba",
-        "qual", "quais", "mostrar", "mostre", "liste", "listar",
-    }
-
-    tokens = re.findall(r"[a-z0-9_]+", q)
-    tokens = [t for t in tokens if t not in fillers and len(t) >= 3]
-
-    if not tokens:
-        return None
-
-    priority_terms = [
-        "peao",
-        "diaria",
-        "container",
-        "locacao",
-        "aluguel",
-        "pagamento",
-        "parcela",
-        "recebimento",
-        "concreto",
-        "cimento",
-        "ferragem",
-        "material",
-        "fornecedor",
-        "servico",
-    ]
-
-    for term in priority_terms:
-        if term in tokens:
-            return term
-
-    return tokens[-1]
-
-
-def _expand_lookup_terms(term: str) -> List[str]:
-    base = _normalize_for_match(term)
-
-    synonyms = {
-        "aluguel": ["aluguel", "locacao"],
-        "locacao": ["locacao", "aluguel"],
-        "diaria": ["diaria", "peao"],
-        "peao": ["peao", "diaria"],
-        "container": ["container"],
-        "pagamento": ["pagamento", "parcela", "recebimento"],
-        "parcela": ["parcela", "pagamento"],
-        "recebimento": ["recebimento", "pagamento", "parcela"],
-        "servico": ["servico", "mao", "peao", "diaria"],
-        "material": ["material", "insumo"],
-    }
-
-    return synonyms.get(base, [base])
 
 
 async def handle_structured_lookup_cost(
@@ -1090,29 +1167,40 @@ async def handle_structured_lookup_cost(
     scope: Dict[str, Optional[str]],
     plan: Dict[str, Any],
 ) -> Dict[str, Any]:
-    snapshot = await get_latest_snapshot(scope)
+    effective_scope = _resolve_effective_scope(question, scope)
+    snapshot = await get_latest_snapshot(effective_scope)
 
     if not snapshot:
         return {
             "answer": (
-                f"Ainda não encontrei dados de custos para a {scope.get('obra') or 'obra informada'}."
+                f"Ainda não encontrei dados para a {effective_scope.get('obra') or 'obra informada'} "
+                f"no contexto de {effective_scope.get('folder') or 'dados'}."
             ),
             "status": "no_data_for_scope",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "snapshot_lookup",
+            },
         }
 
     rows = snapshot.get("rows") or []
     if not rows:
         return {
-            "answer": "A planilha foi encontrada, mas não há linhas de custos disponíveis.",
+            "answer": "A planilha foi encontrada, mas não há linhas disponíveis.",
             "status": "empty_snapshot",
+            "data": {
+                "effective_scope": effective_scope,
+                "source": "snapshot_lookup",
+            },
         }
 
-    lookup_term = _extract_lookup_term(question, scope)
+    lookup_term = _extract_lookup_term(question, effective_scope)
     if not lookup_term:
         return {
-            "answer": "Não consegui identificar qual custo específico você quer buscar.",
+            "answer": "Não consegui identificar qual item específico você quer buscar.",
             "status": "clarify",
             "data": {
+                "effective_scope": effective_scope,
                 "source": "snapshot_lookup",
             },
         }
@@ -1124,26 +1212,43 @@ async def handle_structured_lookup_cost(
         desc_raw = str(r.get("DESC_CUSTO", "")).strip()
         desc_norm = _normalize_for_match(desc_raw)
 
-        if any(term in desc_norm for term in terms):
-            val_raw = r.get("VLR_CUSTO")
+        extra_fields = " ".join([
+            str(r.get("PARCELA", "") or ""),
+            str(r.get("FORMA_PGTO", "") or ""),
+            str(r.get("PREV_PGTO", "") or ""),
+            str(r.get("DATA_PAGAMENTO", "") or ""),
+        ])
+        extra_norm = _normalize_for_match(extra_fields)
+
+        searchable_text = f"{desc_norm} {extra_norm}"
+
+        if any(term in searchable_text for term in terms):
+            val_raw = (
+                r.get("VLR_CUSTO")
+                if r.get("VLR_CUSTO") is not None
+                else r.get("VALOR")
+            )
             val_num = _to_float(val_raw)
             val_fmt = _format_money(val_num) if val_num is not None else str(val_raw)
 
             matches.append(
                 {
-                    "descricao": desc_raw or "sem descrição",
+                    "descricao": desc_raw or str(r.get("PARCELA") or "sem descrição"),
                     "valor": val_num,
                     "valor_raw": val_raw,
                     "valor_fmt": val_fmt,
-                    "data": r.get("DATA"),
+                    "data": r.get("DATA") or r.get("DATA_PAGAMENTO") or r.get("PREV_PGTO"),
+                    "forma_pgto": r.get("FORMA_PGTO"),
+                    "parcela": r.get("PARCELA"),
                 }
             )
 
     if not matches:
         return {
             "answer": (
-                f"Não encontrei custos relacionados a '{lookup_term}' "
-                f"na {scope.get('obra') or 'obra informada'}."
+                f"Não encontrei registros relacionados a '{lookup_term}' "
+                f"na {effective_scope.get('obra') or 'obra informada'} "
+                f"em {effective_scope.get('folder') or 'dados'}."
             ),
             "status": "ok",
             "data": {
@@ -1151,20 +1256,34 @@ async def handle_structured_lookup_cost(
                 "expanded_terms": terms,
                 "matches": [],
                 "count": 0,
+                "effective_scope": effective_scope,
                 "source": "snapshot_lookup",
             },
         }
 
     linhas = []
     for m in matches[:20]:
+        complemento = []
+
+        if m.get("parcela"):
+            complemento.append(f"parcela {m['parcela']}")
+        if m.get("forma_pgto"):
+            complemento.append(f"forma {m['forma_pgto']}")
         if m.get("data"):
-            linhas.append(f"- {m['descricao']}: R$ {m['valor_fmt']} ({m['data']})")
+            complemento.append(f"data {m['data']}")
+
+        extra = f" ({', '.join(complemento)})" if complemento else ""
+
+        if m.get("valor") is not None:
+            linhas.append(f"- {m['descricao']}: R$ {m['valor_fmt']}{extra}")
         else:
-            linhas.append(f"- {m['descricao']}: R$ {m['valor_fmt']}")
+            linhas.append(f"- {m['descricao']}{extra}")
 
     answer = (
-        f"Sim. Encontrei {len(matches)} lançamento(s) relacionados a '{lookup_term}' "
-        f"na {scope.get('obra') or 'obra'}:\n" + "\n".join(linhas)
+        f"Sim. Encontrei {len(matches)} registro(s) relacionados a '{lookup_term}' "
+        f"na {effective_scope.get('obra') or 'obra'} "
+        f"em {effective_scope.get('folder') or 'dados'}:\n"
+        + "\n".join(linhas)
     )
 
     return {
@@ -1175,10 +1294,10 @@ async def handle_structured_lookup_cost(
             "expanded_terms": terms,
             "matches": matches,
             "count": len(matches),
+            "effective_scope": effective_scope,
             "source": "snapshot_lookup",
         },
     }
-
 
 
 async def handle_clarify(
