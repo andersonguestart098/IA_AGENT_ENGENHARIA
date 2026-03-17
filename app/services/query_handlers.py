@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from typing import Dict, Any, Optional, List, Tuple, Set, cast
 
 from mistralai import Mistral
@@ -38,6 +39,13 @@ def _get_mistral() -> Mistral:
 
     _client = Mistral(api_key=MISTRAL_API_KEY)
     return _client
+
+
+def _normalize_for_match(text: str) -> str:
+    text = (text or "").lower().strip()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return text
 
 
 def _build_diff_filter(scope: Dict[str, Optional[str]]) -> Dict[str, Any]:
@@ -174,29 +182,31 @@ def embed_query(text: str) -> List[float]:
 
 
 def _tokenize_for_rerank(text: str) -> List[str]:
-    raw = re.findall(r"[a-zA-ZÀ-ÿ0-9_]+", (text or "").lower())
+    normalized = _normalize_for_match(text)
+    raw = re.findall(r"[a-z0-9_]+", normalized)
+
     stopwords = {
         "a", "o", "e", "de", "da", "do", "das", "dos", "em", "na", "no", "nas", "nos",
         "qual", "quais", "quanto", "quanta", "quero", "me", "mostra", "mostrar", "liste",
         "listar", "tem", "teve", "com", "para", "por", "um", "uma", "os", "as", "que",
-        "foi", "sao", "são", "ate", "até", "agora", "obra", "planilha", "arquivo",
-        "dados",
+        "foi", "sao", "ate", "agora", "obra", "planilha", "arquivo", "dados",
     }
+
     return [t for t in raw if len(t) >= 3 and t not in stopwords]
 
 
 def _infer_folder_from_question(question: str) -> Optional[str]:
-    q = (question or "").lower()
+    q = _normalize_for_match(question)
 
     custos_terms = [
         "custo", "custos", "gasto", "gastos", "despesa", "despesas",
-        "locacao", "locação", "aluguel", "diaria", "diária",
-        "material", "insumo", "servico", "serviço", "fornecedor",
+        "locacao", "aluguel", "diaria",
+        "material", "insumo", "servico", "fornecedor",
         "compra", "compras", "maior custo", "total de custos",
     ]
     faturamento_terms = [
         "faturamento", "parcela", "parcelas", "pagamento",
-        "prev pgto", "previsao de pagamento", "previsão de pagamento",
+        "prev pgto", "previsao de pagamento",
         "forma pgto", "forma de pagamento", "recebimento",
         "recebimentos", "pago", "pagou", "pagamentos",
     ]
@@ -215,21 +225,23 @@ def _keyword_overlap_score(question: str, hit: Dict[str, Any]) -> float:
     if not q_tokens:
         return 0.0
 
-    text_real = str(hit.get("text", "") or "").lower()
-    semantic_keywords = " ".join([str(x) for x in (hit.get("semantic_keywords") or [])]).lower()
-    doc_type = str(hit.get("doc_type", "") or "").lower()
-    metadata = " ".join([
+    text_real = _normalize_for_match(str(hit.get("text", "") or ""))
+    semantic_keywords = _normalize_for_match(
+        " ".join([str(x) for x in (hit.get("semantic_keywords") or [])])
+    )
+    doc_type = _normalize_for_match(str(hit.get("doc_type", "") or ""))
+    metadata = _normalize_for_match(" ".join([
         str(hit.get("file_name", "") or ""),
         str(hit.get("sheet", "") or ""),
         str(hit.get("obra_name", "") or ""),
         str(hit.get("folder_name", "") or ""),
-    ]).lower()
+    ]))
 
     strong_terms = {
-        "locacao", "locação", "aluguel", "diaria", "diária",
-        "concreto", "cimento", "ferragem", "aco", "aço",
-        "eletrica", "elétrica", "hidraulica", "hidráulica",
-        "mão", "mao", "servico", "serviço", "fornecedor",
+        "locacao", "aluguel", "diaria",
+        "concreto", "cimento", "ferragem", "aco",
+        "eletrica", "hidraulica",
+        "mao", "servico", "fornecedor",
         "parcela", "pagamento", "recebimento",
     }
 
@@ -288,8 +300,8 @@ def _rerank_hits(
 ) -> List[Dict[str, Any]]:
     ranked: List[Dict[str, Any]] = []
 
-    scope_obra = (scope.get("obra") or "").strip().lower()
-    scope_folder = (scope.get("folder") or "").strip().lower()
+    scope_obra = _normalize_for_match(scope.get("obra") or "")
+    scope_folder = _normalize_for_match(scope.get("folder") or "")
     inferred_folder = _infer_folder_from_question(question)
 
     for hit in hits:
@@ -299,8 +311,8 @@ def _rerank_hits(
         obra_bonus = 0.0
         folder_bonus = 0.0
 
-        hit_obra = str(hit.get("obra_name") or "").strip().lower()
-        hit_folder = str(hit.get("folder_name") or "").strip().lower()
+        hit_obra = _normalize_for_match(str(hit.get("obra_name") or ""))
+        hit_folder = _normalize_for_match(str(hit.get("folder_name") or ""))
 
         if scope_obra:
             if hit_obra == scope_obra:
