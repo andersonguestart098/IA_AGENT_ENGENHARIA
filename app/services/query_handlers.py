@@ -190,36 +190,49 @@ def _keyword_overlap_score(question: str, hit: Dict[str, Any]) -> float:
     if not q_tokens:
         return 0.0
 
-    semantic_keywords = hit.get("semantic_keywords") or []
-    searchable = " ".join([
-        str(hit.get("text", "") or ""),
+    text_real = str(hit.get("text", "") or "").lower()
+    semantic_keywords = " ".join([str(x) for x in (hit.get("semantic_keywords") or [])]).lower()
+    doc_type = str(hit.get("doc_type", "") or "").lower()
+    metadata = " ".join([
         str(hit.get("file_name", "") or ""),
         str(hit.get("sheet", "") or ""),
         str(hit.get("obra_name", "") or ""),
         str(hit.get("folder_name", "") or ""),
-        " ".join([str(x) for x in semantic_keywords]),
-        str(hit.get("doc_type", "") or ""),
     ]).lower()
-
-    matched = 0
-    strong_matched = 0
 
     strong_terms = {
         "locacao", "locação", "aluguel", "diaria", "diária",
-        "concreto", "cimento", "ferragem", "eletrica", "elétrica",
-        "hidraulica", "hidráulica"
+        "concreto", "cimento", "ferragem", "aco", "aço",
+        "eletrica", "elétrica", "hidraulica", "hidráulica",
+        "mão", "mao", "obra", "servico", "serviço",
     }
 
+    content_matches = 0
+    semantic_matches = 0
+    metadata_matches = 0
+    strong_matches = 0
+
     for tok in q_tokens:
-        if tok in searchable:
-            matched += 1
-            if tok in strong_terms:
-                strong_matched += 1
+        in_text = tok in text_real
+        in_semantic = tok in semantic_keywords or tok in doc_type
+        in_metadata = tok in metadata
 
-    base = min(0.18, matched * 0.025)
-    strong = min(0.18, strong_matched * 0.08)
+        if in_text:
+            content_matches += 1
+        elif in_semantic:
+            semantic_matches += 1
+        elif in_metadata:
+            metadata_matches += 1
 
-    return base + strong
+        if tok in strong_terms and in_text:
+            strong_matches += 1
+
+    content_bonus = min(0.24, content_matches * 0.05)
+    semantic_bonus = min(0.10, semantic_matches * 0.025)
+    metadata_bonus = min(0.04, metadata_matches * 0.01)
+    strong_bonus = min(0.20, strong_matches * 0.08)
+
+    return content_bonus + semantic_bonus + metadata_bonus + strong_bonus
 
 
 def _dedupe_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -248,18 +261,35 @@ def _rerank_hits(
     hits: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     ranked: List[Dict[str, Any]] = []
+
     scope_obra = (scope.get("obra") or "").strip().lower()
+    scope_folder = (scope.get("folder") or "").strip().lower()
 
     for hit in hits:
         vector_score = float(hit.get("score", 0.0) or 0.0)
         keyword_bonus = _keyword_overlap_score(question, hit)
 
         obra_bonus = 0.0
-        hit_obra = str(hit.get("obra_name") or "").strip().lower()
-        if scope_obra and hit_obra == scope_obra:
-            obra_bonus = 0.20
+        folder_bonus = 0.0
 
-        final_score = vector_score + keyword_bonus + obra_bonus
+        hit_obra = str(hit.get("obra_name") or "").strip().lower()
+        hit_folder = str(hit.get("folder_name") or "").strip().lower()
+
+        # bônus / penalidade por obra
+        if scope_obra:
+            if hit_obra == scope_obra:
+                obra_bonus = 0.20
+            else:
+                obra_bonus = -0.08
+
+        # bônus / penalidade leve por pasta
+        if scope_folder:
+            if hit_folder == scope_folder:
+                folder_bonus = 0.08
+            else:
+                folder_bonus = -0.03
+
+        final_score = vector_score + keyword_bonus + obra_bonus + folder_bonus
 
         ranked.append(
             {
@@ -267,6 +297,7 @@ def _rerank_hits(
                 "vector_score": vector_score,
                 "keyword_bonus": keyword_bonus,
                 "obra_bonus": obra_bonus,
+                "folder_bonus": folder_bonus,
                 "final_score": final_score,
             }
         )
@@ -397,9 +428,11 @@ def search_qdrant(question: str, scope: Dict[str, Optional[str]]) -> List[Dict[s
             f"[semantic][top_hit] rank={idx} "
             f"final={hit['final_score']:.4f} "
             f"vector={hit['vector_score']:.4f} "
-            f"bonus={hit['keyword_bonus']:.4f} "
+            f"keyword_bonus={hit['keyword_bonus']:.4f} "
             f"obra_bonus={hit.get('obra_bonus', 0.0):.4f} "
+            f"folder_bonus={hit.get('folder_bonus', 0.0):.4f} "
             f"obra={hit.get('obra_name')} "
+            f"folder={hit.get('folder_name')} "
             f"arquivo={hit.get('file_name')} "
             f"aba={hit.get('sheet')} "
             f"linhas={hit.get('row_start')}..{hit.get('row_end')} "
@@ -423,6 +456,7 @@ def build_search_debug(question: str, scope: Dict[str, Optional[str]], hits: Lis
                 "vector_score": h.get("vector_score"),
                 "keyword_bonus": h.get("keyword_bonus"),
                 "obra_bonus": h.get("obra_bonus"),
+                "folder_bonus": h.get("folder_bonus"),
                 "obra_name": h.get("obra_name"),
                 "folder_name": h.get("folder_name"),
                 "file_name": h.get("file_name"),
