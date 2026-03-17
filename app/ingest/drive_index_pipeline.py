@@ -1,4 +1,3 @@
-# app/ingest/drive_index_pipeline.py
 from __future__ import annotations
 
 import os
@@ -135,8 +134,215 @@ def _fmt(v: Any) -> str:
     return str(v).strip()
 
 
+def _normalize_key(text: str) -> str:
+    return (text or "").strip().lower().replace(" ", "_")
+
+
+def _detect_document_type(header: List[str], sheet_name: str, file_name: str) -> str:
+    joined = " ".join([(sheet_name or ""), (file_name or ""), *header]).lower()
+
+    rules = [
+        (["vlr_custo", "desc_custo", "custo", "despesa", "gasto", "valor"], "planilha de custos de obra"),
+        (["fornecedor", "prestador", "parceiro"], "planilha de fornecedores ou parceiros"),
+        (["material", "insumo", "produto"], "planilha de materiais ou insumos"),
+        (["quantidade", "qtd", "unidade", "saldo"], "planilha quantitativa ou de estoque"),
+        (["data", "historico", "histórico", "observacao", "observação"], "planilha de lançamentos e histórico"),
+        (["medicao", "medição", "avance", "avanço", "etapa"], "planilha de medição ou avanço de obra"),
+    ]
+
+    for keywords, label in rules:
+        if any(k in joined for k in keywords):
+            return label
+
+    return "planilha de obra"
+
+
+def _semantic_keywords(header: List[str], sheet_name: str, file_name: str) -> List[str]:
+    joined = " ".join([(sheet_name or ""), (file_name or ""), *header]).lower()
+
+    keywords = {
+        "obra",
+        "engenharia",
+        "planilha",
+        "arquivo",
+        "aba",
+        "dados",
+        "lançamento",
+        "lançamentos",
+        "valor",
+    }
+
+    mapping = {
+        "custo": ["custos", "despesas", "gastos", "financeiro", "orçamento"],
+        "vlr_custo": ["custos", "despesas", "gastos", "financeiro", "orçamento"],
+        "desc_custo": ["descrição", "tipo de custo", "lançamento", "despesa"],
+        "fornecedor": ["fornecedor", "prestador", "empresa", "terceiro"],
+        "material": ["material", "insumo", "produto", "item"],
+        "quantidade": ["quantidade", "qtd", "saldo"],
+        "qtd": ["quantidade", "qtd", "saldo"],
+        "data": ["data", "período", "lançamento"],
+        "categoria": ["categoria", "grupo", "classificação"],
+        "grupo": ["categoria", "grupo", "classificação"],
+        "servico": ["serviço", "mão de obra", "execução"],
+        "serviço": ["serviço", "mão de obra", "execução"],
+        "medicao": ["medição", "avanço", "progresso"],
+        "medição": ["medição", "avanço", "progresso"],
+    }
+
+    for col in header:
+        norm = _normalize_key(col)
+        for trigger, adds in mapping.items():
+            if trigger in norm:
+                keywords.update(adds)
+
+    if "eletrica" in joined or "elétrica" in joined:
+        keywords.update(["elétrica", "instalação elétrica"])
+    if "hidraulica" in joined or "hidráulica" in joined:
+        keywords.update(["hidráulica", "instalação hidráulica"])
+    if "ferragem" in joined:
+        keywords.update(["ferragem", "aço", "armadura"])
+    if "concreto" in joined:
+        keywords.update(["concreto", "cimento", "estrutura"])
+    if "aluguel" in joined or "locacao" in joined or "locação" in joined:
+        keywords.update(["aluguel", "locação", "equipamento"])
+
+    return sorted(k for k in keywords if k)
+
+
+def _friendly_field_name(col: str) -> str:
+    c = _normalize_key(col)
+
+    mapping = {
+        "data": "data",
+        "desc_custo": "descrição do custo",
+        "descricao": "descrição",
+        "descrição": "descrição",
+        "vlr_custo": "valor do custo",
+        "valor": "valor",
+        "fornecedor": "fornecedor",
+        "categoria": "categoria",
+        "grupo": "grupo",
+        "qtd": "quantidade",
+        "quantidade": "quantidade",
+        "material": "material",
+        "servico": "serviço",
+        "serviço": "serviço",
+        "historico": "histórico",
+        "histórico": "histórico",
+        "observacao": "observação",
+        "observação": "observação",
+    }
+
+    return mapping.get(c, col.strip())
+
+
+def _row_to_natural_sentence(header: List[str], row: Dict[str, Any]) -> str:
+    parts: List[str] = []
+
+    for col in header:
+        val = _fmt(row.get(col))
+        if val == "":
+            continue
+        parts.append(f"{_friendly_field_name(col)} {val}")
+
+    if not parts:
+        return ""
+
+    return "; ".join(parts)
+
+
+def _infer_sheet_summary(header: List[str], rows: List[Dict[str, Any]], doc_type: str) -> str:
+    normalized = [_normalize_key(h) for h in header]
+
+    if "desc_custo" in normalized or "vlr_custo" in normalized:
+        return "Esta aba contém linhas de planilha relacionadas a custos, despesas ou lançamentos financeiros da obra."
+
+    if "fornecedor" in normalized:
+        return "Esta aba contém informações relacionadas a fornecedores, parceiros ou prestadores envolvidos na obra."
+
+    if "material" in normalized or "qtd" in normalized or "quantidade" in normalized:
+        return "Esta aba contém itens, materiais, quantidades ou informações operacionais associadas à obra."
+
+    if "historico" in normalized or "histórico" in normalized:
+        return "Esta aba contém histórico, anotações ou registros cronológicos da obra."
+
+    return f"Esta aba contém dados de {doc_type}."
+
+
+def _build_chunk_text(
+    *,
+    obra_name: Optional[str],
+    parent_folder_name: Optional[str],
+    file_name: Optional[str],
+    sheet_name: str,
+    header: List[str],
+    rows: List[Dict[str, Any]],
+    row_start: int,
+    row_end: int,
+) -> str:
+    doc_type = _detect_document_type(header, sheet_name, file_name or "")
+    keywords = _semantic_keywords(header, sheet_name, file_name or "")
+    summary = _infer_sheet_summary(header, rows, doc_type)
+
+    lines: List[str] = []
+    lines.append("DOCUMENTO PLANILHA DE OBRA")
+    lines.append(f"OBRA: {obra_name or 'não informada'}")
+    lines.append(f"PASTA: {parent_folder_name or 'não informada'}")
+    lines.append(f"ARQUIVO: {file_name or 'não informado'}")
+    lines.append(f"ABA: {sheet_name}")
+    lines.append(f"TIPO_DOCUMENTO: {doc_type}")
+    lines.append(f"INTERVALO_LINHAS: {row_start + 1} até {row_end + 1}")
+
+    if keywords:
+        lines.append("PALAVRAS_CHAVE: " + ", ".join(keywords))
+
+    lines.append("")
+    lines.append("COLUNAS DISPONÍVEIS:")
+    lines.append(" | ".join([h for h in header if h]) or "(sem colunas)")
+    lines.append("")
+    lines.append("RESUMO SEMÂNTICO:")
+    lines.append(summary)
+    lines.append("")
+    lines.append("LINHAS DA PLANILHA:")
+
+    natural_count = 0
+    for idx, row in enumerate(rows, start=row_start + 1):
+        sentence = _row_to_natural_sentence(header, row)
+        if sentence:
+            lines.append(f"Linha {idx}: {sentence}")
+            natural_count += 1
+
+    if natural_count == 0:
+        lines.append("Nenhuma linha textual relevante encontrada neste bloco.")
+
+    lines.append("")
+    lines.append("FORMATO ESTRUTURADO:")
+
+    for idx, row in enumerate(rows, start=row_start + 1):
+        parts = []
+
+        for col in header:
+            val = _fmt(row.get(col))
+            if val != "":
+                parts.append(f"{col}={val}")
+
+        for col in header:
+            f = row.get(f"__formula__{col}")
+            miss = row.get(f"__missing__{col}")
+            if f and miss:
+                parts.append(f"{col}_FORMULA={f}")
+
+        if parts:
+            lines.append(f"L{idx}: " + " ; ".join(parts))
+
+    return "\n".join(lines).strip()
+
+
 def _sheet_rows_to_chunks_text(
     *,
+    obra_name: Optional[str],
+    parent_folder_name: Optional[str],
+    file_name: Optional[str],
     sheet_name: str,
     header: List[str],
     rows: List[Dict[str, Any]],
@@ -154,32 +360,22 @@ def _sheet_rows_to_chunks_text(
 
     for i in range(0, len(rows), rows_per_chunk):
         block = rows[i:i + rows_per_chunk]
-        lines: List[str] = []
+        row_start = i
+        row_end = min(i + rows_per_chunk, len(rows)) - 1
 
-        lines.append(f"## Sheet: {sheet_name}")
-        lines.append("HEADER: " + " | ".join([h for h in header if h]))
-        lines.append("ROWS:")
+        text = _build_chunk_text(
+            obra_name=obra_name,
+            parent_folder_name=parent_folder_name,
+            file_name=file_name,
+            sheet_name=sheet_name,
+            header=header,
+            rows=block,
+            row_start=row_start,
+            row_end=row_end,
+        )
 
-        for j, r in enumerate(block):
-            parts = []
-
-            for col in header:
-                val = _fmt(r.get(col))
-                if val != "":
-                    parts.append(f"{col}={val}")
-
-            for col in header:
-                f = r.get(f"__formula__{col}")
-                miss = r.get(f"__missing__{col}")
-                if f and miss:
-                    parts.append(f"{col}_FORMULA={f}")
-
-            if parts:
-                lines.append(f"L{i + j + 1}: " + " ; ".join(parts))
-
-        text = "\n".join(lines).strip()
         if text:
-            chunks.append((i, min(i + rows_per_chunk, len(rows)) - 1, text))
+            chunks.append((row_start, row_end, text))
 
     return chunks
 
@@ -389,6 +585,9 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                     print(f"[ingest][diff] no previous snapshot file_id={file_id} sheet={sheet_name}")
 
                 chunks = _sheet_rows_to_chunks_text(
+                    obra_name=obra_ctx.get("obra_name"),
+                    parent_folder_name=doc.get("parent_folder_name"),
+                    file_name=name,
                     sheet_name=sheet_name,
                     header=header,
                     rows=rows,
@@ -423,6 +622,9 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                     collection_ready = True
                     print(f"[ingest][qdrant] ensure_collection ok name={QDRANT_COLLECTION} size={vector_size}")
 
+                doc_type = _detect_document_type(header, sheet_name, name or "")
+                semantic_keywords = _semantic_keywords(header, sheet_name, name or "")
+
                 for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
                     row_start, row_end, text = chunk
                     snapshot_ref = f"{file_id}:{sheet_name}:{sheet_sha1}"
@@ -435,7 +637,7 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                         f"sheet_sha1={sheet_sha1} chunk_sha1={chunk_sha1[:10]} "
                         f"snapshot_ref={snapshot_ref}"
                     )
-                    print(f"[ingest][point][preview] {text[:500]}")
+                    print(f"[ingest][point][preview] {text[:700]}")
 
                     payload = dict(payload_base)
                     payload.update(
@@ -449,6 +651,10 @@ async def index_new_drive_files(limit: int = 25) -> Dict[str, Any]:
                             "chunk_sha1": chunk_sha1,
                             "snapshot_ref": snapshot_ref,
                             "text": text,
+                            "text_preview": text[:400],
+                            "doc_type": doc_type,
+                            "semantic_keywords": semantic_keywords,
+                            "header_columns": header[:SHEET_MAX_COLS],
                         }
                     )
 

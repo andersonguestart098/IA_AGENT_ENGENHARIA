@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+import os
+from typing import Optional
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Header
 
 from app.services.job_store import create_job, get_job
 from app.workers.demo_worker import run_demo_job
@@ -12,13 +15,26 @@ from app.ingest.qdrant_indexer import get_qdrant
 from app.drive.changes import DriveChangesClient
 from app.services.drive_state_store import DriveStateStore
 from app.services.ai_query_service import query_ai
-
+from app.services.reindex_service import (
+    reindex_all_drive_files,
+    reindex_single_file,
+)
 
 router = APIRouter()
+
+ADMIN_REINDEX_TOKEN = os.getenv("ADMIN_REINDEX_TOKEN")
 
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def _check_admin_token(x_admin_token: Optional[str]) -> None:
+    if not ADMIN_REINDEX_TOKEN:
+        raise HTTPException(500, "ADMIN_REINDEX_TOKEN não configurado")
+
+    if x_admin_token != ADMIN_REINDEX_TOKEN:
+        raise HTTPException(401, "Token inválido")
 
 
 @router.get("/health")
@@ -157,7 +173,6 @@ async def drive_webhook(request: Request):
         f"resource_uri={resource_uri}"
     )
 
-    # 1) secret
     secret = getattr(app.state, "drive_webhook_secret", None)
     if not secret:
         _log("[drive_webhook] drive_webhook_secret missing in app.state")
@@ -167,7 +182,6 @@ async def drive_webhook(request: Request):
         _log("[drive_webhook] invalid token")
         raise HTTPException(401, "invalid token")
 
-    # 2) state store
     store = getattr(app.state, "drive_state_store", None)
     if not store:
         _log("[drive_webhook] drive_state_store missing")
@@ -186,18 +200,15 @@ async def drive_webhook(request: Request):
         )
         raise HTTPException(409, "unknown channel")
 
-    # 3) ignora eventos que não são mudança real
     if resource_state in {"sync", "not_exists"}:
         _log(f"[drive_webhook] ignored state={resource_state}")
         return {"ok": True, "ignored": resource_state}
 
-    # 4) redis obrigatório
     redis = getattr(app.state, "redis", None)
     if not redis:
         _log("[drive_webhook] redis pool missing in app.state")
         raise HTTPException(500, "redis pool missing in app.state")
 
-    # 5) DEDUPE por message_number (TTL 1h)
     if message_number:
         dedupe_key = f"drive:webhook:dedupe:{channel_id}:{message_number}"
         first = await redis.set(dedupe_key, "1", nx=True, ex=3600)
@@ -205,14 +216,12 @@ async def drive_webhook(request: Request):
             _log(f"[drive_webhook] deduped message_number={message_number}")
             return {"ok": True, "deduped": True}
 
-    # 6) THROTTLE curto
     cooldown_key = "drive:webhook:cooldown"
     cooldown = await redis.set(cooldown_key, "1", nx=True, ex=10)
     if not cooldown:
         _log("[drive_webhook] throttled")
         return {"ok": True, "throttled": True}
 
-    # 7) enqueue worker job
     job = await redis.enqueue_job("process_drive_changes", {"source": "webhook"})
     _log(f"[drive_webhook] worker job enqueued job_id={getattr(job, 'job_id', None)}")
 
@@ -250,9 +259,9 @@ async def drive_health(request: Request):
         "redis": bool(getattr(app.state, "redis", None)),
     }
 
+
 @router.post("/ai/query")
 async def ai_query(payload: dict):
-
     question = payload.get("question")
 
     if not question:
@@ -272,3 +281,43 @@ async def qdrant_ping():
     except Exception as e:
         raise HTTPException(500, f"qdrant ping failed: {e}")
 
+
+@router.post("/admin/reindex/all")
+async def admin_reindex_all(
+    background: BackgroundTasks,
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    _check_admin_token(x_admin_token)
+
+    _log("[reindex][all] requested background start")
+    background.add_task(reindex_all_drive_files)
+
+    return {
+        "ok": True,
+        "message": "Reindexação total iniciada em background.",
+    }
+
+
+@router.post("/admin/reindex/all/sync")
+async def admin_reindex_all_sync(
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    _check_admin_token(x_admin_token)
+
+    _log("[reindex][all][sync] requested")
+    result = await reindex_all_drive_files()
+
+    return result
+
+
+@router.post("/admin/reindex/file/{file_id}")
+async def admin_reindex_file(
+    file_id: str,
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    _check_admin_token(x_admin_token)
+
+    _log(f"[reindex][file] requested file_id={file_id}")
+    result = await reindex_single_file(file_id)
+
+    return result

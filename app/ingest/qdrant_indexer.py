@@ -66,6 +66,7 @@ def ensure_collection(client: QdrantClient, collection: str, vector_size: int) -
         "name",
         "sheet",
         "doc_kind",
+        "doc_type",
     ]
 
     for field in keyword_fields:

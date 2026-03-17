@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Dict, Any
 
 from app.services.query_entities import extract_entities
-from app.services.query_router import classify_route
+from app.services.intent_classifier import classify_route_with_mistral
 from app.services.query_policy import apply_route_policy
 from app.services.query_handlers import (
     handle_structured_total,
@@ -38,7 +38,8 @@ async def query_ai(question: str) -> Dict[str, Any]:
         }
 
     entities = extract_entities(question)
-    initial_plan = classify_route(question, entities)
+
+    initial_plan = classify_route_with_mistral(question, entities)
     final_plan = await apply_route_policy(question, entities, initial_plan)
 
     route = final_plan.get("route", "clarify")
@@ -80,5 +81,12 @@ async def query_ai(question: str) -> Dict[str, Any]:
         "route_confidence": final_plan.get("confidence"),
         "route_reason": final_plan.get("reason"),
         "policy_adjusted": final_plan.get("policy_adjusted", False),
-        "metadata": result.get("data", {}),
+        "metadata": {
+            **result.get("data", {}),
+            "classifier": initial_plan.get("classifier"),
+            "classifier_error": initial_plan.get("classifier_error"),
+            "needs_scope": initial_plan.get("needs_scope"),
+            "has_snapshot": final_plan.get("has_snapshot"),
+            "has_diff": final_plan.get("has_diff"),
+        },
     }

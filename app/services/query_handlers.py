@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, Any, Optional, List, cast
+import re
+from typing import Dict, Any, Optional, List, Tuple, Set, cast
 
 from mistralai import Mistral
 from qdrant_client.http import models as rest
@@ -9,13 +10,29 @@ from qdrant_client.http import models as rest
 from app.core.mongo import get_db
 from app.ingest.qdrant_indexer import get_qdrant
 
-
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
 MISTRAL_EMBED_MODEL = os.getenv("MISTRAL_EMBED_MODEL", "mistral-embed")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "drive_rag")
 
-client = Mistral(api_key=MISTRAL_API_KEY)
+SEMANTIC_TOP_K = int(os.getenv("SEMANTIC_TOP_K", "12"))
+SEMANTIC_SCORE_THRESHOLD = float(os.getenv("SEMANTIC_SCORE_THRESHOLD", "0.40"))
+SEMANTIC_FINAL_TOP_K = int(os.getenv("SEMANTIC_FINAL_TOP_K", "8"))
+
+_client: Optional[Mistral] = None
+
+
+def _get_mistral() -> Mistral:
+    global _client
+
+    if _client is not None:
+        return _client
+
+    if not MISTRAL_API_KEY:
+        raise RuntimeError("MISTRAL_API_KEY não configurado")
+
+    _client = Mistral(api_key=MISTRAL_API_KEY)
+    return _client
 
 
 def _build_diff_filter(scope: Dict[str, Optional[str]]) -> Dict[str, Any]:
@@ -54,7 +71,7 @@ async def get_latest_snapshot(scope: Dict[str, Optional[str]]) -> Optional[Dict[
 
     return await db["drive_sheet_snapshots"].find_one(
         flt,
-        sort=[("indexed_at", -1), ("modified_time", -1), ("created_at", -1)]
+        sort=[("indexed_at", -1), ("modified_time", -1), ("created_at", -1)],
     )
 
 
@@ -64,7 +81,7 @@ async def get_last_diff(scope: Dict[str, Optional[str]]) -> Optional[Dict[str, A
 
     return await db["drive_sheet_diffs"].find_one(
         flt,
-        sort=[("created_at", -1), ("modified_time", -1)]
+        sort=[("created_at", -1), ("modified_time", -1)],
     )
 
 
@@ -143,6 +160,7 @@ def _build_qdrant_filter(scope: Dict[str, Optional[str]]) -> Optional[rest.Filte
 
 
 def embed_query(text: str) -> List[float]:
+    client = _get_mistral()
     resp = client.embeddings.create(
         model=MISTRAL_EMBED_MODEL,
         inputs=[text],
@@ -150,41 +168,219 @@ def embed_query(text: str) -> List[float]:
     return resp.data[0].embedding
 
 
-def search_qdrant(question: str, scope: Dict[str, Optional[str]]) -> List[str]:
-    qdrant = get_qdrant()
-    query_vector = embed_query(question)
+def _tokenize_for_rerank(text: str) -> List[str]:
+    raw = re.findall(r"[a-zA-ZÀ-ÿ0-9_]+", (text or "").lower())
+    stopwords = {
+        "a", "o", "e", "de", "da", "do", "das", "dos", "em", "na", "no", "nas", "nos",
+        "qual", "quais", "quanto", "quanta", "quero", "me", "mostra", "mostrar", "liste",
+        "listar", "tem", "teve", "com", "para", "por", "um", "uma", "os", "as", "que",
+        "foi", "sao", "são", "ate", "até", "agora", "obra", "planilha", "arquivo",
+    }
+    return [t for t in raw if len(t) >= 3 and t not in stopwords]
 
-    filters_to_try: List[Optional[rest.Filter]] = [
-        _build_qdrant_filter(scope),
-        _build_qdrant_filter({
-            "obra": scope.get("obra"),
-            "folder": None,
-            "file_name": None,
-        }),
-        None,
-    ]
 
-    for q_filter in filters_to_try:
-        results = qdrant.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=query_vector,
-            query_filter=q_filter,
-            limit=5,
+def _keyword_overlap_score(question: str, hit: Dict[str, Any]) -> float:
+    q_tokens = set(_tokenize_for_rerank(question))
+    if not q_tokens:
+        return 0.0
+
+    bucket = " ".join([
+        str(hit.get("text", "") or ""),
+        str(hit.get("file_name", "") or ""),
+        str(hit.get("sheet", "") or ""),
+        str(hit.get("obra_name", "") or ""),
+        str(hit.get("folder_name", "") or ""),
+    ]).lower()
+
+    matched = sum(1 for tok in q_tokens if tok in bucket)
+
+    # bônus leve para não matar o score vetorial
+    return min(0.20, matched * 0.03)
+
+
+def _dedupe_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: Set[Tuple[Any, Any, Any, Any]] = set()
+    out: List[Dict[str, Any]] = []
+
+    for hit in hits:
+        key = (
+            hit.get("file_name"),
+            hit.get("sheet"),
+            hit.get("row_start"),
+            hit.get("row_end"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(hit)
+
+    return out
+
+
+def _rerank_hits(question: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ranked: List[Dict[str, Any]] = []
+
+    for hit in hits:
+        vector_score = float(hit.get("score", 0.0) or 0.0)
+        keyword_bonus = _keyword_overlap_score(question, hit)
+        final_score = vector_score + keyword_bonus
+
+        ranked.append(
+            {
+                **hit,
+                "vector_score": vector_score,
+                "keyword_bonus": keyword_bonus,
+                "final_score": final_score,
+            }
         )
 
-        texts: List[str] = []
-        points = getattr(results, "points", None) or []
+    ranked.sort(key=lambda x: x["final_score"], reverse=True)
+    return ranked
 
-        for p in points:
-            payload = getattr(p, "payload", None) or {}
-            txt = payload.get("text", "")
-            if txt:
-                texts.append(txt)
 
-        if texts:
-            return texts
+def _search_qdrant_once(
+    *,
+    query_vector: List[float],
+    q_filter: Optional[rest.Filter],
+    limit: int,
+    score_threshold: float,
+) -> List[Dict[str, Any]]:
+    qdrant = get_qdrant()
 
-    return []
+    # Se tua versão do client não aceitar query_points, troca aqui por search()
+    result = qdrant.query_points(
+        collection_name=QDRANT_COLLECTION,
+        query=query_vector,
+        query_filter=q_filter,
+        limit=limit,
+        with_payload=True,
+        score_threshold=score_threshold,
+    )
+
+    points = getattr(result, "points", None) or []
+
+    hits: List[Dict[str, Any]] = []
+    for p in points:
+        payload = getattr(p, "payload", None) or {}
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            continue
+
+        hits.append(
+            {
+                "score": float(getattr(p, "score", 0.0) or 0.0),
+                "text": text,
+                "file_id": payload.get("file_id"),
+                "file_name": payload.get("name"),
+                "sheet": payload.get("sheet"),
+                "obra_name": payload.get("obra_name"),
+                "folder_name": payload.get("parent_folder_name"),
+                "row_start": payload.get("row_start"),
+                "row_end": payload.get("row_end"),
+                "doc_type": payload.get("doc_type"),
+                "semantic_keywords": payload.get("semantic_keywords") or [],
+                "text_preview": payload.get("text_preview"),
+            }
+        )
+
+    return hits
+
+
+def search_qdrant(question: str, scope: Dict[str, Optional[str]]) -> List[Dict[str, Any]]:
+    query_vector = embed_query(question)
+
+    complete_scope = {
+        "obra": scope.get("obra"),
+        "folder": scope.get("folder"),
+        "file_name": scope.get("file_name"),
+    }
+    only_obra_scope = {
+        "obra": scope.get("obra"),
+        "folder": None,
+        "file_name": None,
+    }
+    only_folder_scope = {
+        "obra": None,
+        "folder": scope.get("folder"),
+        "file_name": None,
+    }
+
+    filters_to_try: List[Tuple[str, Optional[rest.Filter]]] = [
+        ("complete_scope", _build_qdrant_filter(complete_scope)),
+        ("only_obra", _build_qdrant_filter(only_obra_scope)),
+        ("only_folder", _build_qdrant_filter(only_folder_scope)),
+        ("global", None),
+    ]
+
+    merged_hits: List[Dict[str, Any]] = []
+
+    for label, q_filter in filters_to_try:
+        try:
+            hits = _search_qdrant_once(
+                query_vector=query_vector,
+                q_filter=q_filter,
+                limit=SEMANTIC_TOP_K,
+                score_threshold=SEMANTIC_SCORE_THRESHOLD,
+            )
+
+            print(
+                f"[semantic][qdrant] stage={label} "
+                f"hits={len(hits)} "
+                f"obra={scope.get('obra')} folder={scope.get('folder')} file_name={scope.get('file_name')}"
+            )
+
+            merged_hits.extend(hits)
+
+            # se já trouxe bastante hit bom cedo, pode parar
+            if len(merged_hits) >= SEMANTIC_TOP_K:
+                break
+
+        except Exception as e:
+            print(f"[semantic][qdrant][error] stage={label} err={type(e).__name__}: {e}")
+
+    merged_hits = _dedupe_hits(merged_hits)
+    ranked_hits = _rerank_hits(question, merged_hits)
+    final_hits = ranked_hits[:SEMANTIC_FINAL_TOP_K]
+
+    for idx, hit in enumerate(final_hits[:5], start=1):
+        print(
+            f"[semantic][top_hit] rank={idx} "
+            f"final={hit['final_score']:.4f} "
+            f"vector={hit['vector_score']:.4f} "
+            f"bonus={hit['keyword_bonus']:.4f} "
+            f"obra={hit.get('obra_name')} "
+            f"arquivo={hit.get('file_name')} "
+            f"aba={hit.get('sheet')} "
+            f"linhas={hit.get('row_start')}..{hit.get('row_end')}"
+        )
+
+    return final_hits
+
+
+def _build_context_text(hits: List[Dict[str, Any]], max_chars: int = 14000) -> str:
+    blocks: List[str] = []
+    total_chars = 0
+
+    for i, hit in enumerate(hits, start=1):
+        block = (
+            f"[TRECHO {i}] "
+            f"final_score={hit.get('final_score', hit.get('score', 0.0)):.4f} | "
+            f"vector_score={hit.get('vector_score', hit.get('score', 0.0)):.4f} | "
+            f"obra={hit.get('obra_name')} | "
+            f"arquivo={hit.get('file_name')} | "
+            f"aba={hit.get('sheet')} | "
+            f"linhas={hit.get('row_start')}..{hit.get('row_end')} | "
+            f"tipo={hit.get('doc_type')}\n"
+            f"{hit.get('text', '')}\n"
+        )
+
+        if total_chars + len(block) > max_chars:
+            break
+
+        blocks.append(block)
+        total_chars += len(block)
+
+    return "\n".join(blocks).strip()
 
 
 def ask_llm(question: str, context: str) -> str:
@@ -194,28 +390,32 @@ Você é um analista de dados da empresa.
 Pergunta do usuário:
 {question}
 
-Dados disponíveis:
+Contexto recuperado:
 {context}
 
 Regras:
 - Responda de forma objetiva e executiva.
-- Não invente dados que não estejam no contexto.
+- Responda SOMENTE com base no contexto.
+- Não invente dados.
 - Se houver incerteza, diga claramente.
 - Se a pergunta pedir análise, resuma o que os dados mostram.
-- Se a pergunta pedir explicação, responda com base apenas no contexto.
-"""
+- Se houver números, preserve os valores corretamente.
+- Se o contexto não for suficiente para responder integralmente, diga isso.
+""".strip()
 
     messages = cast(Any, [
-        {"role": "system", "content": "Você é um analista de dados da empresa."},
+        {"role": "system", "content": "Você é um analista de dados da empresa. Responda apenas com base no contexto."},
         {"role": "user", "content": prompt},
     ])
 
+    client = _get_mistral()
     resp = client.chat.complete(
         model=MISTRAL_MODEL,
         messages=messages,
+        temperature=0.1,
     )
 
-    return resp.choices[0].message.content
+    return str(resp.choices[0].message.content or "").strip()
 
 
 async def handle_structured_total(
@@ -238,11 +438,12 @@ async def handle_structured_total(
     total = await calculate_total(snapshot)
 
     return {
-        "answer": f"O total atual de custos da {scope.get('obra') or 'obra'} é {_format_money(total)}.",
+        "answer": f"O total atual de custos da {scope.get('obra') or 'obra'} é R$ {_format_money(total)}.",
         "status": "ok",
         "data": {
             "total": total,
             "formatted_total": _format_money(total),
+            "source": "snapshot",
         },
     }
 
@@ -271,6 +472,7 @@ async def handle_structured_diff(
         "data": {
             "added_count": diff.get("added_count", 0),
             "removed_count": diff.get("removed_count", 0),
+            "source": "diff",
         },
     }
 
@@ -296,6 +498,7 @@ async def handle_structured_last(
                     "descricao": desc,
                     "valor": val,
                     "data": data,
+                    "source": "diff_added_row",
                 },
             }
 
@@ -328,6 +531,7 @@ async def handle_structured_last(
             "descricao": desc,
             "valor": val,
             "data": data,
+            "source": "snapshot_last_row",
         },
     }
 
@@ -362,12 +566,15 @@ async def handle_structured_list_costs(
         val_raw = r.get("VLR_CUSTO")
         val_num = _to_float(val_raw)
         val_fmt = _format_money(val_num) if val_num is not None else str(val_raw)
+
         lines.append(f"- {desc}: R$ {val_fmt}")
-        items.append({
-            "descricao": desc,
-            "valor": val_num,
-            "valor_raw": val_raw,
-        })
+        items.append(
+            {
+                "descricao": desc,
+                "valor": val_num,
+                "valor_raw": val_raw,
+            }
+        )
 
     answer = (
         f"Os custos identificados para a {scope.get('obra') or 'obra'} são:\n"
@@ -380,6 +587,7 @@ async def handle_structured_list_costs(
         "data": {
             "items": items,
             "count": len(items),
+            "source": "snapshot",
         },
     }
 
@@ -405,11 +613,13 @@ async def handle_structured_max_cost(
     for r in rows:
         v = _to_float(r.get("VLR_CUSTO"))
         if v is not None:
-            valid_rows.append({
-                "DATA": r.get("DATA"),
-                "DESC_CUSTO": r.get("DESC_CUSTO"),
-                "VLR_CUSTO": v,
-            })
+            valid_rows.append(
+                {
+                    "DATA": r.get("DATA"),
+                    "DESC_CUSTO": r.get("DESC_CUSTO"),
+                    "VLR_CUSTO": v,
+                }
+            )
 
     if not valid_rows:
         return {
@@ -434,6 +644,7 @@ async def handle_structured_max_cost(
             "valor": valor,
             "formatted_valor": _format_money(valor),
             "data": data,
+            "source": "snapshot_max",
         },
     }
 
@@ -460,11 +671,13 @@ async def handle_structured_insights(
     for r in rows:
         v = _to_float(r.get("VLR_CUSTO"))
         if v is not None:
-            valid_rows.append({
-                "DATA": r.get("DATA"),
-                "DESC_CUSTO": r.get("DESC_CUSTO"),
-                "VLR_CUSTO": v,
-            })
+            valid_rows.append(
+                {
+                    "DATA": r.get("DATA"),
+                    "DESC_CUSTO": r.get("DESC_CUSTO"),
+                    "VLR_CUSTO": v,
+                }
+            )
 
     if not valid_rows:
         return {
@@ -499,6 +712,7 @@ async def handle_structured_insights(
             "total": total,
             "maior_custo": maior,
             "recorrentes": recorrentes,
+            "source": "snapshot_insights",
         },
     }
 
@@ -509,22 +723,39 @@ async def handle_semantic_rag(
     plan: Dict[str, Any],
 ) -> Dict[str, Any]:
     try:
-        contexts = search_qdrant(question, scope)
+        hits = search_qdrant(question, scope)
     except Exception as e:
         return {
             "answer": f"Não consegui consultar o contexto vetorial agora: {type(e).__name__}: {e}",
             "status": "vector_error",
         }
 
-    context_text = "\n\n".join(contexts)
+    if not hits:
+        return {
+            "answer": (
+                f"Ainda não encontrei dados suficientes para a {scope.get('obra') or 'obra informada'} "
+                f"nesse contexto. Tente informar a obra, a pasta ou o nome do arquivo."
+            ),
+            "status": "insufficient_retrieval",
+            "data": {
+                "contexts_found": 0,
+                "hits": [],
+            },
+        }
+
+    context_text = _build_context_text(hits)
 
     if not context_text.strip():
         return {
             "answer": (
-                f"Ainda não encontrei dados suficientes para a {scope.get('obra') or 'obra informada'} "
-                f"nesse contexto."
+                f"Encontrei registros vetoriais, mas sem contexto textual suficiente para responder "
+                f"com segurança sobre a {scope.get('obra') or 'obra informada'}."
             ),
             "status": "insufficient_retrieval",
+            "data": {
+                "contexts_found": len(hits),
+                "hits": hits,
+            },
         }
 
     answer = ask_llm(question, context_text)
@@ -533,7 +764,61 @@ async def handle_semantic_rag(
         "answer": answer,
         "status": "ok",
         "data": {
-            "contexts_found": len(contexts),
+            "contexts_found": len(hits),
+            "hits": [
+                {
+                    "final_score": h.get("final_score"),
+                    "vector_score": h.get("vector_score"),
+                    "keyword_bonus": h.get("keyword_bonus"),
+                    "file_name": h.get("file_name"),
+                    "sheet": h.get("sheet"),
+                    "obra_name": h.get("obra_name"),
+                    "folder_name": h.get("folder_name"),
+                    "row_start": h.get("row_start"),
+                    "row_end": h.get("row_end"),
+                    "doc_type": h.get("doc_type"),
+                }
+                for h in hits
+            ],
+            "source": "qdrant_semantic",
+        },
+    }
+
+    context_text = _build_context_text(hits)
+
+    if not context_text.strip():
+        return {
+            "answer": (
+                f"Encontrei registros vetoriais, mas sem contexto textual suficiente para responder "
+                f"com segurança sobre a {scope.get('obra') or 'obra informada'}."
+            ),
+            "status": "insufficient_retrieval",
+            "data": {
+                "contexts_found": len(hits),
+                "hits": hits,
+            },
+        }
+
+    answer = ask_llm(question, context_text)
+
+    return {
+        "answer": answer,
+        "status": "ok",
+        "data": {
+            "contexts_found": len(hits),
+            "hits": [
+                {
+                    "score": h["score"],
+                    "file_name": h["file_name"],
+                    "sheet": h["sheet"],
+                    "obra_name": h["obra_name"],
+                    "folder_name": h["folder_name"],
+                    "row_start": h["row_start"],
+                    "row_end": h["row_end"],
+                }
+                for h in hits
+            ],
+            "source": "qdrant_semantic",
         },
     }
 
