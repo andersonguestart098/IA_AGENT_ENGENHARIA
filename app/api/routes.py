@@ -20,6 +20,11 @@ from app.services.reindex_service import (
     reindex_single_file,
 )
 
+from app.services.query_entities import extract_entities
+from app.services.intent_classifier import classify_route_with_mistral
+from app.services.query_policy import apply_route_policy
+from app.services.query_handlers import search_qdrant, build_search_debug
+
 router = APIRouter()
 
 ADMIN_REINDEX_TOKEN = os.getenv("ADMIN_REINDEX_TOKEN")
@@ -321,3 +326,27 @@ async def admin_reindex_file(
     result = await reindex_single_file(file_id)
 
     return result
+
+@router.post("/ai/query/debug")
+async def ai_query_debug(payload: dict):
+    question = payload.get("question")
+
+    if not question:
+        raise HTTPException(400, "question missing")
+
+    question = question.strip()
+    entities = extract_entities(question)
+    initial_plan = classify_route_with_mistral(question, entities)
+    final_plan = await apply_route_policy(question, entities, initial_plan)
+
+    hits = []
+    if final_plan.get("route") == "semantic_rag":
+        hits = search_qdrant(question, entities)
+
+    return {
+        "question": question,
+        "entities": entities,
+        "initial_plan": initial_plan,
+        "final_plan": final_plan,
+        "search_debug": build_search_debug(question, entities, hits),
+    }

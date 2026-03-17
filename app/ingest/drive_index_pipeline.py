@@ -37,7 +37,7 @@ MISTRAL_EMBED_BATCH = int(os.getenv("MISTRAL_EMBED_BATCH", "96"))
 EMBED_TEXT_MAX_CHARS = int(os.getenv("EMBED_TEXT_MAX_CHARS", "12000"))
 
 # Chunk planilha
-SHEET_ROWS_PER_CHUNK = int(os.getenv("SHEET_ROWS_PER_CHUNK", "60"))
+SHEET_ROWS_PER_CHUNK = int(os.getenv("SHEET_ROWS_PER_CHUNK", "20"))
 SHEET_MAX_COLS = int(os.getenv("SHEET_MAX_COLS", "80"))
 
 # Segurança / limites
@@ -347,14 +347,47 @@ def _sheet_rows_to_chunks_text(
     header: List[str],
     rows: List[Dict[str, Any]],
     rows_per_chunk: int = SHEET_ROWS_PER_CHUNK,
+    overlap_rows: int = 5,
 ) -> List[Tuple[int, int, str]]:
     """
     chunks: (row_start, row_end, text)
     row_start/end são índices 0-based em relação a rows (sem header).
+    overlap_rows cria uma pequena sobreposição entre blocos.
     """
     chunks: List[Tuple[int, int, str]] = []
     if not rows:
         return chunks
+
+    header = (header or [])[:SHEET_MAX_COLS]
+
+    step = max(1, rows_per_chunk - overlap_rows)
+    i = 0
+
+    while i < len(rows):
+        row_start = i
+        row_end = min(i + rows_per_chunk, len(rows)) - 1
+        block = rows[row_start:row_end + 1]
+
+        text = _build_chunk_text(
+            obra_name=obra_name,
+            parent_folder_name=parent_folder_name,
+            file_name=file_name,
+            sheet_name=sheet_name,
+            header=header,
+            rows=block,
+            row_start=row_start,
+            row_end=row_end,
+        )
+
+        if text:
+            chunks.append((row_start, row_end, text))
+
+        if row_end >= len(rows) - 1:
+            break
+
+        i += step
+
+    return chunks
 
     header = (header or [])[:SHEET_MAX_COLS]
 

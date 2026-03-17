@@ -16,10 +16,15 @@ MISTRAL_EMBED_MODEL = os.getenv("MISTRAL_EMBED_MODEL", "mistral-embed")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "drive_rag")
 
 SEMANTIC_TOP_K = int(os.getenv("SEMANTIC_TOP_K", "12"))
-SEMANTIC_SCORE_THRESHOLD = float(os.getenv("SEMANTIC_SCORE_THRESHOLD", "0.40"))
 SEMANTIC_FINAL_TOP_K = int(os.getenv("SEMANTIC_FINAL_TOP_K", "8"))
+SEMANTIC_SCORE_THRESHOLD = float(os.getenv("SEMANTIC_SCORE_THRESHOLD", "0.40"))
+SEMANTIC_CONTEXT_MAX_CHARS = int(os.getenv("SEMANTIC_CONTEXT_MAX_CHARS", "14000"))
 
 _client: Optional[Mistral] = None
+
+
+def _log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def _get_mistral() -> Mistral:
@@ -175,6 +180,7 @@ def _tokenize_for_rerank(text: str) -> List[str]:
         "qual", "quais", "quanto", "quanta", "quero", "me", "mostra", "mostrar", "liste",
         "listar", "tem", "teve", "com", "para", "por", "um", "uma", "os", "as", "que",
         "foi", "sao", "são", "ate", "até", "agora", "obra", "planilha", "arquivo",
+        "custos", "custo", "dados",
     }
     return [t for t in raw if len(t) >= 3 and t not in stopwords]
 
@@ -184,22 +190,24 @@ def _keyword_overlap_score(question: str, hit: Dict[str, Any]) -> float:
     if not q_tokens:
         return 0.0
 
-    bucket = " ".join([
+    semantic_keywords = hit.get("semantic_keywords") or []
+    searchable = " ".join([
         str(hit.get("text", "") or ""),
         str(hit.get("file_name", "") or ""),
         str(hit.get("sheet", "") or ""),
         str(hit.get("obra_name", "") or ""),
         str(hit.get("folder_name", "") or ""),
+        " ".join([str(x) for x in semantic_keywords]),
+        str(hit.get("doc_type", "") or ""),
     ]).lower()
 
-    matched = sum(1 for tok in q_tokens if tok in bucket)
+    matched = sum(1 for tok in q_tokens if tok in searchable)
 
-    # bônus leve para não matar o score vetorial
-    return min(0.20, matched * 0.03)
+    return min(0.25, matched * 0.035)
 
 
 def _dedupe_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen: Set[Tuple[Any, Any, Any, Any]] = set()
+    seen: Set[Tuple[Any, Any, Any, Any, Any]] = set()
     out: List[Dict[str, Any]] = []
 
     for hit in hits:
@@ -208,6 +216,7 @@ def _dedupe_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             hit.get("sheet"),
             hit.get("row_start"),
             hit.get("row_end"),
+            hit.get("chunk_index"),
         )
         if key in seen:
             continue
@@ -247,17 +256,26 @@ def _search_qdrant_once(
 ) -> List[Dict[str, Any]]:
     qdrant = get_qdrant()
 
-    # Se tua versão do client não aceitar query_points, troca aqui por search()
-    result = qdrant.query_points(
-        collection_name=QDRANT_COLLECTION,
-        query=query_vector,
-        query_filter=q_filter,
-        limit=limit,
-        with_payload=True,
-        score_threshold=score_threshold,
-    )
-
-    points = getattr(result, "points", None) or []
+    try:
+        result = qdrant.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=query_vector,
+            query_filter=q_filter,
+            limit=limit,
+            with_payload=True,
+            score_threshold=score_threshold,
+        )
+        points = getattr(result, "points", None) or []
+    except Exception:
+        result = qdrant.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=query_vector,
+            query_filter=q_filter,
+            limit=limit,
+            with_payload=True,
+            score_threshold=score_threshold,
+        )
+        points = result or []
 
     hits: List[Dict[str, Any]] = []
     for p in points:
@@ -277,6 +295,7 @@ def _search_qdrant_once(
                 "folder_name": payload.get("parent_folder_name"),
                 "row_start": payload.get("row_start"),
                 "row_end": payload.get("row_end"),
+                "chunk_index": payload.get("chunk_index"),
                 "doc_type": payload.get("doc_type"),
                 "semantic_keywords": payload.get("semantic_keywords") or [],
                 "text_preview": payload.get("text_preview"),
@@ -314,6 +333,11 @@ def search_qdrant(question: str, scope: Dict[str, Optional[str]]) -> List[Dict[s
 
     merged_hits: List[Dict[str, Any]] = []
 
+    _log(
+        f"[semantic][search] question={question!r} "
+        f"obra={scope.get('obra')} folder={scope.get('folder')} file_name={scope.get('file_name')}"
+    )
+
     for label, q_filter in filters_to_try:
         try:
             hits = _search_qdrant_once(
@@ -323,27 +347,25 @@ def search_qdrant(question: str, scope: Dict[str, Optional[str]]) -> List[Dict[s
                 score_threshold=SEMANTIC_SCORE_THRESHOLD,
             )
 
-            print(
-                f"[semantic][qdrant] stage={label} "
-                f"hits={len(hits)} "
-                f"obra={scope.get('obra')} folder={scope.get('folder')} file_name={scope.get('file_name')}"
+            _log(
+                f"[semantic][search] stage={label} hits={len(hits)} "
+                f"threshold={SEMANTIC_SCORE_THRESHOLD}"
             )
 
             merged_hits.extend(hits)
 
-            # se já trouxe bastante hit bom cedo, pode parar
             if len(merged_hits) >= SEMANTIC_TOP_K:
                 break
 
         except Exception as e:
-            print(f"[semantic][qdrant][error] stage={label} err={type(e).__name__}: {e}")
+            _log(f"[semantic][search][error] stage={label} err={type(e).__name__}:{e}")
 
     merged_hits = _dedupe_hits(merged_hits)
     ranked_hits = _rerank_hits(question, merged_hits)
     final_hits = ranked_hits[:SEMANTIC_FINAL_TOP_K]
 
     for idx, hit in enumerate(final_hits[:5], start=1):
-        print(
+        _log(
             f"[semantic][top_hit] rank={idx} "
             f"final={hit['final_score']:.4f} "
             f"vector={hit['vector_score']:.4f} "
@@ -351,13 +373,42 @@ def search_qdrant(question: str, scope: Dict[str, Optional[str]]) -> List[Dict[s
             f"obra={hit.get('obra_name')} "
             f"arquivo={hit.get('file_name')} "
             f"aba={hit.get('sheet')} "
-            f"linhas={hit.get('row_start')}..{hit.get('row_end')}"
+            f"linhas={hit.get('row_start')}..{hit.get('row_end')} "
+            f"tipo={hit.get('doc_type')}"
         )
 
     return final_hits
 
 
-def _build_context_text(hits: List[Dict[str, Any]], max_chars: int = 14000) -> str:
+def build_search_debug(question: str, scope: Dict[str, Optional[str]], hits: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "question": question,
+        "scope": scope,
+        "threshold": SEMANTIC_SCORE_THRESHOLD,
+        "top_k": SEMANTIC_TOP_K,
+        "final_top_k": SEMANTIC_FINAL_TOP_K,
+        "hits": [
+            {
+                "rank": i + 1,
+                "final_score": h.get("final_score"),
+                "vector_score": h.get("vector_score"),
+                "keyword_bonus": h.get("keyword_bonus"),
+                "obra_name": h.get("obra_name"),
+                "folder_name": h.get("folder_name"),
+                "file_name": h.get("file_name"),
+                "sheet": h.get("sheet"),
+                "row_start": h.get("row_start"),
+                "row_end": h.get("row_end"),
+                "doc_type": h.get("doc_type"),
+                "semantic_keywords": h.get("semantic_keywords"),
+                "text_preview": (h.get("text_preview") or h.get("text") or "")[:500],
+            }
+            for i, h in enumerate(hits)
+        ],
+    }
+
+
+def _build_context_text(hits: List[Dict[str, Any]], max_chars: int = SEMANTIC_CONTEXT_MAX_CHARS) -> str:
     blocks: List[str] = []
     total_chars = 0
 
@@ -740,6 +791,7 @@ async def handle_semantic_rag(
             "data": {
                 "contexts_found": 0,
                 "hits": [],
+                "search_debug": build_search_debug(question, scope, []),
             },
         }
 
@@ -755,6 +807,7 @@ async def handle_semantic_rag(
             "data": {
                 "contexts_found": len(hits),
                 "hits": hits,
+                "search_debug": build_search_debug(question, scope, hits),
             },
         }
 
@@ -780,44 +833,7 @@ async def handle_semantic_rag(
                 }
                 for h in hits
             ],
-            "source": "qdrant_semantic",
-        },
-    }
-
-    context_text = _build_context_text(hits)
-
-    if not context_text.strip():
-        return {
-            "answer": (
-                f"Encontrei registros vetoriais, mas sem contexto textual suficiente para responder "
-                f"com segurança sobre a {scope.get('obra') or 'obra informada'}."
-            ),
-            "status": "insufficient_retrieval",
-            "data": {
-                "contexts_found": len(hits),
-                "hits": hits,
-            },
-        }
-
-    answer = ask_llm(question, context_text)
-
-    return {
-        "answer": answer,
-        "status": "ok",
-        "data": {
-            "contexts_found": len(hits),
-            "hits": [
-                {
-                    "score": h["score"],
-                    "file_name": h["file_name"],
-                    "sheet": h["sheet"],
-                    "obra_name": h["obra_name"],
-                    "folder_name": h["folder_name"],
-                    "row_start": h["row_start"],
-                    "row_end": h["row_end"],
-                }
-                for h in hits
-            ],
+            "search_debug": build_search_debug(question, scope, hits),
             "source": "qdrant_semantic",
         },
     }
