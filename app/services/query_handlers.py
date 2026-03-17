@@ -1012,20 +1012,56 @@ async def handle_semantic_rag(
         },
     }
 
-def _extract_lookup_term(question: str) -> Optional[str]:
+def _extract_lookup_term(question: str, scope: Dict[str, Optional[str]]) -> Optional[str]:
     q = _normalize_for_match(question)
+
+    obra = _normalize_for_match(scope.get("obra") or "")
+    folder = _normalize_for_match(scope.get("folder") or "")
+    file_name = _normalize_for_match(scope.get("file_name") or "")
+
+    # remove contexto conhecido do escopo
+    for piece in [obra, folder, file_name]:
+        if piece:
+            q = q.replace(piece, " ")
+
+    # remove padrões tipo "obra xxx" que sobrarem
+    q = re.sub(r"\bobra\b", " ", q)
 
     fillers = {
         "teve", "tem", "existe", "existiu", "ha", "houve",
-        "algum", "alguma", "custo", "custos", "com", "na", "no",
-        "da", "do", "de", "em", "obra"
+        "algum", "alguma",
+        "custo", "custos", "gasto", "gastos", "despesa", "despesas",
+        "com", "na", "no", "da", "do", "de", "em", "para", "por",
+        "arquivo", "planilha", "pasta", "aba",
+        "qual", "quais", "mostrar", "mostre", "liste", "listar",
     }
 
     tokens = re.findall(r"[a-z0-9_]+", q)
-    tokens = [t for t in tokens if t not in fillers]
+    tokens = [t for t in tokens if t not in fillers and len(t) >= 3]
 
     if not tokens:
         return None
+
+    priority_terms = [
+        "peao",
+        "diaria",
+        "container",
+        "locacao",
+        "aluguel",
+        "pagamento",
+        "parcela",
+        "recebimento",
+        "concreto",
+        "cimento",
+        "ferragem",
+        "material",
+        "fornecedor",
+        "servico",
+    ]
+
+    for term in priority_terms:
+        if term in tokens:
+            return term
 
     return tokens[-1]
 
@@ -1036,13 +1072,112 @@ def _expand_lookup_terms(term: str) -> List[str]:
     synonyms = {
         "aluguel": ["aluguel", "locacao"],
         "locacao": ["locacao", "aluguel"],
-        "diaria": ["diaria"],
+        "diaria": ["diaria", "peao"],
         "peao": ["peao", "diaria"],
         "container": ["container"],
         "pagamento": ["pagamento", "parcela", "recebimento"],
+        "parcela": ["parcela", "pagamento"],
+        "recebimento": ["recebimento", "pagamento", "parcela"],
+        "servico": ["servico", "mao", "peao", "diaria"],
+        "material": ["material", "insumo"],
     }
 
     return synonyms.get(base, [base])
+
+
+async def handle_structured_lookup_cost(
+    question: str,
+    scope: Dict[str, Optional[str]],
+    plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    snapshot = await get_latest_snapshot(scope)
+
+    if not snapshot:
+        return {
+            "answer": (
+                f"Ainda não encontrei dados de custos para a {scope.get('obra') or 'obra informada'}."
+            ),
+            "status": "no_data_for_scope",
+        }
+
+    rows = snapshot.get("rows") or []
+    if not rows:
+        return {
+            "answer": "A planilha foi encontrada, mas não há linhas de custos disponíveis.",
+            "status": "empty_snapshot",
+        }
+
+    lookup_term = _extract_lookup_term(question, scope)
+    if not lookup_term:
+        return {
+            "answer": "Não consegui identificar qual custo específico você quer buscar.",
+            "status": "clarify",
+            "data": {
+                "source": "snapshot_lookup",
+            },
+        }
+
+    terms = _expand_lookup_terms(lookup_term)
+    matches: List[Dict[str, Any]] = []
+
+    for r in rows:
+        desc_raw = str(r.get("DESC_CUSTO", "")).strip()
+        desc_norm = _normalize_for_match(desc_raw)
+
+        if any(term in desc_norm for term in terms):
+            val_raw = r.get("VLR_CUSTO")
+            val_num = _to_float(val_raw)
+            val_fmt = _format_money(val_num) if val_num is not None else str(val_raw)
+
+            matches.append(
+                {
+                    "descricao": desc_raw or "sem descrição",
+                    "valor": val_num,
+                    "valor_raw": val_raw,
+                    "valor_fmt": val_fmt,
+                    "data": r.get("DATA"),
+                }
+            )
+
+    if not matches:
+        return {
+            "answer": (
+                f"Não encontrei custos relacionados a '{lookup_term}' "
+                f"na {scope.get('obra') or 'obra informada'}."
+            ),
+            "status": "ok",
+            "data": {
+                "lookup_term": lookup_term,
+                "expanded_terms": terms,
+                "matches": [],
+                "count": 0,
+                "source": "snapshot_lookup",
+            },
+        }
+
+    linhas = []
+    for m in matches[:20]:
+        if m.get("data"):
+            linhas.append(f"- {m['descricao']}: R$ {m['valor_fmt']} ({m['data']})")
+        else:
+            linhas.append(f"- {m['descricao']}: R$ {m['valor_fmt']}")
+
+    answer = (
+        f"Sim. Encontrei {len(matches)} lançamento(s) relacionados a '{lookup_term}' "
+        f"na {scope.get('obra') or 'obra'}:\n" + "\n".join(linhas)
+    )
+
+    return {
+        "answer": answer,
+        "status": "ok",
+        "data": {
+            "lookup_term": lookup_term,
+            "expanded_terms": terms,
+            "matches": matches,
+            "count": len(matches),
+            "source": "snapshot_lookup",
+        },
+    }
 
 
 async def handle_structured_lookup_cost(
