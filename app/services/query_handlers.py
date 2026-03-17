@@ -711,6 +711,51 @@ def _expand_lookup_terms(term: str) -> List[str]:
     return synonyms.get(base, [base])
 
 
+def _row_matches_lookup(
+    term: str,
+    terms: List[str],
+    row: Dict[str, Any],
+    folder: Optional[str],
+) -> bool:
+    desc_raw = str(row.get("DESC_CUSTO", "") or "").strip()
+    desc_norm = _normalize_for_match(desc_raw)
+
+    extra_fields = " ".join([
+        str(row.get("PARCELA", "") or ""),
+        str(row.get("FORMA_PGTO", "") or ""),
+        str(row.get("PREV_PGTO", "") or ""),
+        str(row.get("DATA_PAGAMENTO", "") or ""),
+    ])
+    extra_norm = _normalize_for_match(extra_fields)
+
+    searchable_text = f"{desc_norm} {extra_norm}"
+
+    if any(t in searchable_text for t in terms):
+        return True
+
+    folder_norm = _normalize_for_match(folder or "")
+
+    if folder_norm == "faturamento":
+        if term == "pagamento":
+            return any([
+                row.get("DATA_PAGAMENTO"),
+                row.get("PREV_PGTO"),
+                row.get("FORMA_PGTO"),
+                row.get("PARCELA"),
+            ])
+
+        if term == "parcela":
+            return bool(row.get("PARCELA"))
+
+        if term == "recebimento":
+            return bool(row.get("DATA_PAGAMENTO") or row.get("PREV_PGTO"))
+
+        if term == "vencimento":
+            return bool(row.get("PREV_PGTO"))
+
+    return False
+
+
 async def handle_structured_total(
     question: str,
     scope: Dict[str, Optional[str]],
@@ -1209,20 +1254,8 @@ async def handle_structured_lookup_cost(
     matches: List[Dict[str, Any]] = []
 
     for r in rows:
-        desc_raw = str(r.get("DESC_CUSTO", "")).strip()
-        desc_norm = _normalize_for_match(desc_raw)
-
-        extra_fields = " ".join([
-            str(r.get("PARCELA", "") or ""),
-            str(r.get("FORMA_PGTO", "") or ""),
-            str(r.get("PREV_PGTO", "") or ""),
-            str(r.get("DATA_PAGAMENTO", "") or ""),
-        ])
-        extra_norm = _normalize_for_match(extra_fields)
-
-        searchable_text = f"{desc_norm} {extra_norm}"
-
-        if any(term in searchable_text for term in terms):
+        if _row_matches_lookup(lookup_term, terms, r, effective_scope.get("folder")):
+            desc_raw = str(r.get("DESC_CUSTO", "")).strip()
             val_raw = (
                 r.get("VLR_CUSTO")
                 if r.get("VLR_CUSTO") is not None
