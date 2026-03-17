@@ -201,9 +201,25 @@ def _keyword_overlap_score(question: str, hit: Dict[str, Any]) -> float:
         str(hit.get("doc_type", "") or ""),
     ]).lower()
 
-    matched = sum(1 for tok in q_tokens if tok in searchable)
+    matched = 0
+    strong_matched = 0
 
-    return min(0.25, matched * 0.035)
+    strong_terms = {
+        "locacao", "locação", "aluguel", "diaria", "diária",
+        "concreto", "cimento", "ferragem", "eletrica", "elétrica",
+        "hidraulica", "hidráulica"
+    }
+
+    for tok in q_tokens:
+        if tok in searchable:
+            matched += 1
+            if tok in strong_terms:
+                strong_matched += 1
+
+    base = min(0.18, matched * 0.025)
+    strong = min(0.18, strong_matched * 0.08)
+
+    return base + strong
 
 
 def _dedupe_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -226,19 +242,31 @@ def _dedupe_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _rerank_hits(question: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _rerank_hits(
+    question: str,
+    scope: Dict[str, Optional[str]],
+    hits: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
     ranked: List[Dict[str, Any]] = []
+    scope_obra = (scope.get("obra") or "").strip().lower()
 
     for hit in hits:
         vector_score = float(hit.get("score", 0.0) or 0.0)
         keyword_bonus = _keyword_overlap_score(question, hit)
-        final_score = vector_score + keyword_bonus
+
+        obra_bonus = 0.0
+        hit_obra = str(hit.get("obra_name") or "").strip().lower()
+        if scope_obra and hit_obra == scope_obra:
+            obra_bonus = 0.20
+
+        final_score = vector_score + keyword_bonus + obra_bonus
 
         ranked.append(
             {
                 **hit,
                 "vector_score": vector_score,
                 "keyword_bonus": keyword_bonus,
+                "obra_bonus": obra_bonus,
                 "final_score": final_score,
             }
         )
@@ -393,6 +421,7 @@ def build_search_debug(question: str, scope: Dict[str, Optional[str]], hits: Lis
                 "final_score": h.get("final_score"),
                 "vector_score": h.get("vector_score"),
                 "keyword_bonus": h.get("keyword_bonus"),
+                "obra_bonus": h.get("obra_bonus"),
                 "obra_name": h.get("obra_name"),
                 "folder_name": h.get("folder_name"),
                 "file_name": h.get("file_name"),

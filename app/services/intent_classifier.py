@@ -25,6 +25,10 @@ VALID_ROUTES = {
 _client: Optional[Mistral] = None
 
 
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 def _get_client() -> Mistral:
     global _client
 
@@ -66,6 +70,7 @@ def _fallback_route(question: str) -> Dict[str, Any]:
         "ultima",
         "última atualização",
         "último lançamento",
+        "ultimo lançamento",
     ]):
         return {
             "route": "structured_last",
@@ -81,6 +86,7 @@ def _fallback_route(question: str) -> Dict[str, Any]:
         "maior despesa",
         "custo mais alto",
         "gasto mais alto",
+        "despesa mais alta",
     ]):
         return {
             "route": "structured_max_cost",
@@ -117,6 +123,7 @@ def _fallback_route(question: str) -> Dict[str, Any]:
         "resuma",
         "o que os dados mostram",
         "interpreta",
+        "interpretar",
     ]):
         return {
             "route": "structured_insights",
@@ -138,6 +145,7 @@ def _fallback_route(question: str) -> Dict[str, Any]:
         "valor acumulado",
         "ate agora",
         "até agora",
+        "valor total",
     ]):
         return {
             "route": "structured_total",
@@ -194,6 +202,9 @@ Critérios:
 - O usuário pode escrever de forma torta, incompleta ou informal.
 - Priorize semantic_rag quando a pergunta não for claramente matemática/estruturada.
 - Use clarify quando a pergunta estiver curta ou ambígua demais para agir com segurança.
+- Responda SOMENTE com JSON válido.
+- Não use markdown.
+- Não use bloco de código.
 
 Pergunta:
 {question}
@@ -211,6 +222,36 @@ Responda SOMENTE JSON válido no formato:
 """.strip()
 
 
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    text = (text or "").strip()
+
+    if not text:
+        raise ValueError("Resposta vazia da Mistral")
+
+    # remove code fences
+    if text.startswith("```"):
+        text = text.strip()
+
+        if text.startswith("```json"):
+            text = text[len("```json"):].strip()
+        elif text.startswith("```JSON"):
+            text = text[len("```JSON"):].strip()
+        elif text.startswith("```"):
+            text = text[3:].strip()
+
+        if text.endswith("```"):
+            text = text[:-3].strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"Resposta sem JSON válido: {text[:300]}")
+
+    candidate = text[start:end + 1]
+    return json.loads(candidate)
+
+
 def classify_route_with_mistral(question: str, entities: Dict[str, Any]) -> Dict[str, Any]:
     try:
         client = _get_client()
@@ -221,7 +262,10 @@ def classify_route_with_mistral(question: str, entities: Dict[str, Any]) -> Dict
             messages=[
                 {
                     "role": "system",
-                    "content": "Você é um classificador de intenções. Responda somente JSON válido.",
+                    "content": (
+                        "Você é um classificador de intenções. "
+                        "Responda somente JSON válido, sem markdown, sem explicações extras."
+                    ),
                 },
                 {
                     "role": "user",
@@ -232,7 +276,9 @@ def classify_route_with_mistral(question: str, entities: Dict[str, Any]) -> Dict
         )
 
         content = (resp.choices[0].message.content or "").strip()
-        data = json.loads(content)
+        _log(f"[intent][raw] {content[:500]}")
+
+        data = _extract_json_object(content)
 
         route = str(data.get("route", "")).strip()
         confidence = float(data.get("confidence", 0.0))
@@ -242,7 +288,7 @@ def classify_route_with_mistral(question: str, entities: Dict[str, Any]) -> Dict
         if route not in VALID_ROUTES:
             raise ValueError(f"Rota inválida retornada pela LLM: {route}")
 
-        return {
+        result = {
             "route": route,
             "confidence": max(0.0, min(confidence, 1.0)),
             "reason": reason,
@@ -250,7 +296,17 @@ def classify_route_with_mistral(question: str, entities: Dict[str, Any]) -> Dict
             "classifier": "mistral",
         }
 
+        _log(
+            f"[intent][parsed] route={result['route']} "
+            f"confidence={result['confidence']} "
+            f"needs_scope={result['needs_scope']} "
+            f"reason={result['reason']}"
+        )
+
+        return result
+
     except Exception as e:
         fb = _fallback_route(question)
         fb["classifier_error"] = f"{type(e).__name__}: {e}"
+        _log(f"[intent][fallback] err={fb['classifier_error']} route={fb['route']}")
         return fb
