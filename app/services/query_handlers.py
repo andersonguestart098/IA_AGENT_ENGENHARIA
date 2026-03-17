@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import unicodedata
 from typing import Dict, Any, Optional, List, Tuple, Set, cast
 
@@ -544,6 +545,24 @@ def _build_context_text(hits: List[Dict[str, Any]], max_chars: int = SEMANTIC_CO
     return "\n".join(blocks).strip()
 
 
+def _is_retryable_llm_error(exc: Exception) -> bool:
+    msg = f"{type(exc).__name__}: {exc}".lower()
+
+    retry_terms = [
+        "503",
+        "429",
+        "timeout",
+        "timed out",
+        "connection",
+        "service unavailable",
+        "unreachable_backend",
+        "rate limit",
+        "temporarily unavailable",
+    ]
+
+    return any(term in msg for term in retry_terms)
+
+
 def ask_llm(question: str, context: str) -> str:
     prompt = f"""
 Você é um analista de dados da empresa.
@@ -570,13 +589,38 @@ Regras:
     ])
 
     client = _get_mistral()
-    resp = client.chat.complete(
-        model=MISTRAL_MODEL,
-        messages=messages,
-        temperature=0.1,
-    )
+    delays = [0.8, 1.5, 3.0]
+    last_error: Optional[Exception] = None
 
-    return str(resp.choices[0].message.content or "").strip()
+    for attempt, delay in enumerate(delays, start=1):
+        try:
+            _log(f"[semantic][llm] attempt={attempt} model={MISTRAL_MODEL}")
+
+            resp = client.chat.complete(
+                model=MISTRAL_MODEL,
+                messages=messages,
+                temperature=0.1,
+            )
+
+            content = str(resp.choices[0].message.content or "").strip()
+            _log(f"[semantic][llm] success attempt={attempt}")
+            return content
+
+        except Exception as e:
+            last_error = e
+            retryable = _is_retryable_llm_error(e)
+
+            _log(
+                f"[semantic][llm_error] attempt={attempt} "
+                f"retryable={retryable} err={type(e).__name__}:{e}"
+            )
+
+            if not retryable or attempt == len(delays):
+                break
+
+            time.sleep(delay)
+
+    raise RuntimeError(f"LLM unavailable after retries: {type(last_error).__name__}: {last_error}")
 
 
 async def handle_structured_total(
@@ -921,11 +965,26 @@ async def handle_semantic_rag(
             },
         }
 
-    answer = ask_llm(question, context_text)
+    try:
+        answer = ask_llm(question, context_text)
+        llm_status = "ok"
+        llm_error = None
+    except Exception as e:
+        llm_status = "fallback"
+        llm_error = f"{type(e).__name__}: {e}"
+
+        top = hits[0] if hits else {}
+        preview = (top.get("text") or "")[:1200]
+
+        answer = (
+            "Encontrei contexto relevante para responder, mas o gerador de resposta ficou indisponível no momento. "
+            "Segue o trecho mais relevante recuperado:\n\n"
+            f"{preview}"
+        )
 
     return {
         "answer": answer,
-        "status": "ok",
+        "status": "ok" if llm_status == "ok" else "partial_fallback",
         "data": {
             "contexts_found": len(hits),
             "hits": [
@@ -948,6 +1007,8 @@ async def handle_semantic_rag(
             ],
             "search_debug": build_search_debug(question, scope, hits),
             "source": "qdrant_semantic",
+            "llm_status": llm_status,
+            "llm_error": llm_error,
         },
     }
 
