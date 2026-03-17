@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import Dict, Any, List
 
 from app.core.mongo import get_db
@@ -8,21 +9,32 @@ from app.ingest.drive_index_pipeline import index_new_drive_files
 from app.ingest.qdrant_indexer import get_qdrant, delete_by_file_id
 
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "drive_rag")
+COLLECTION = "drive_files"
 
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 async def mark_all_files_pending() -> int:
     db = get_db()
 
-    result = await db["drive_files"].update_many(
-        {},
+    result = await db[COLLECTION].update_many(
+        {
+            "file_id": {"$exists": True, "$ne": None},
+            "trashed": {"$ne": True},
+            "status": {"$ne": "DELETED"},
+        },
         {
             "$set": {
-                "indexed": False,
-                "index_error": None,
+                "status": "NEW",
+                "indexed_at": None,
+                "error": None,
+                "updated_at": _utc_iso(),
             }
         },
     )
@@ -38,8 +50,12 @@ async def reindex_all_drive_files(batch_size: int = 25) -> Dict[str, Any]:
 
     _log(f"[reindex][all] start batch_size={batch_size} collection={QDRANT_COLLECTION}")
 
-    docs = await db["drive_files"].find(
-        {"file_id": {"$exists": True, "$ne": None}}
+    docs = await db[COLLECTION].find(
+        {
+            "file_id": {"$exists": True, "$ne": None},
+            "trashed": {"$ne": True},
+            "status": {"$ne": "DELETED"},
+        }
     ).to_list(length=None)
 
     total_docs = len(docs)
@@ -125,12 +141,9 @@ async def reindex_all_drive_files(batch_size: int = 25) -> Dict[str, Any]:
 
         if failed_batch:
             _log(
-                f"[reindex][all] batch={batch_num} failed_sample="
-                f"{failed_batch[:10]}"
+                f"[reindex][all] batch={batch_num} failed_sample={failed_batch[:10]}"
             )
 
-        # condição de parada correta:
-        # se o pipeline não indexou nada e não teve erro, acabou a fila
         if indexed == 0 and errors == 0:
             _log(f"[reindex][all] batch={batch_num} stop_condition=empty_cycle")
             break
@@ -171,7 +184,14 @@ async def reindex_single_file(file_id: str) -> Dict[str, Any]:
 
     _log(f"[reindex][file] start file_id={file_id} collection={QDRANT_COLLECTION}")
 
-    doc = await db["drive_files"].find_one({"file_id": file_id})
+    doc = await db[COLLECTION].find_one(
+        {
+            "file_id": file_id,
+            "trashed": {"$ne": True},
+            "status": {"$ne": "DELETED"},
+        }
+    )
+
     if not doc:
         _log(f"[reindex][file] not_found file_id={file_id}")
         return {
@@ -188,12 +208,15 @@ async def reindex_single_file(file_id: str) -> Dict[str, Any]:
             f"file_id={file_id} err={type(e).__name__}:{e}"
         )
 
-    update_result = await db["drive_files"].update_one(
+    now_iso = _utc_iso()
+    update_result = await db[COLLECTION].update_one(
         {"file_id": file_id},
         {
             "$set": {
-                "indexed": False,
-                "index_error": None,
+                "status": "NEW",
+                "indexed_at": None,
+                "error": None,
+                "updated_at": now_iso,
             }
         },
     )
