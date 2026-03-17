@@ -16,6 +16,7 @@ VALID_ROUTES = {
     "structured_diff",
     "structured_last",
     "structured_list_costs",
+    "structured_lookup_cost",
     "structured_insights",
     "structured_max_cost",
     "semantic_rag",
@@ -40,6 +41,62 @@ def _get_client() -> Mistral:
 
     _client = Mistral(api_key=MISTRAL_API_KEY)
     return _client
+
+
+def _looks_like_cost_lookup(question: str) -> bool:
+    q = normalize_text(question)
+
+    lookup_terms = [
+        "teve",
+        "tem",
+        "existe",
+        "existiu",
+        "ha",
+        "há",
+        "houve",
+        "algum",
+        "alguma",
+    ]
+
+    list_terms = [
+        "quais custos",
+        "quais sao os custos",
+        "quais são os custos",
+        "listar custos",
+        "liste os custos",
+        "mostre os custos",
+        "quais gastos",
+        "quais despesas",
+    ]
+
+    if any(term in q for term in list_terms):
+        return False
+
+    return any(term in q for term in lookup_terms)
+
+
+def _looks_like_cost_domain(question: str) -> bool:
+    q = normalize_text(question)
+    return any(term in q for term in [
+        "custo",
+        "custos",
+        "gasto",
+        "gastos",
+        "despesa",
+        "despesas",
+        "locacao",
+        "locação",
+        "aluguel",
+        "diaria",
+        "diária",
+        "container",
+        "peao",
+        "peão",
+        "material",
+        "servico",
+        "serviço",
+        "fornecedor",
+    ])
 
 
 def _fallback_route(question: str) -> Dict[str, Any]:
@@ -92,6 +149,15 @@ def _fallback_route(question: str) -> Dict[str, Any]:
             "route": "structured_max_cost",
             "confidence": 0.72,
             "reason": "fallback_max_keywords",
+            "needs_scope": False,
+            "classifier": "fallback",
+        }
+
+    if _looks_like_cost_lookup(question) and _looks_like_cost_domain(question):
+        return {
+            "route": "structured_lookup_cost",
+            "confidence": 0.88,
+            "reason": "fallback_specific_cost_lookup",
             "needs_scope": False,
             "classifier": "fallback",
         }
@@ -183,6 +249,7 @@ Classifique a pergunta do usuário em EXATAMENTE uma rota:
 - structured_diff
 - structured_last
 - structured_list_costs
+- structured_lookup_cost
 - structured_insights
 - structured_max_cost
 - semantic_rag
@@ -192,7 +259,8 @@ Definições:
 - structured_total: soma, acumulado, total, valor total, custo total.
 - structured_diff: mudanças, diferenças, o que mudou, comparação antes/depois.
 - structured_last: último lançamento, última atualização, item mais recente.
-- structured_list_costs: listar custos, mostrar custos, quais despesas/gastos.
+- structured_list_costs: listar custos, mostrar custos, quais despesas/gastos de forma ampla.
+- structured_lookup_cost: verificar se existe um custo específico, item específico ou tipo específico. Ex.: "teve peão?", "tem diária?", "existe container?", "houve locação?".
 - structured_insights: análise gerencial, resumo analítico, principais padrões.
 - structured_max_cost: maior custo/gasto/despesa.
 - semantic_rag: pergunta aberta, contextual, explicativa, documental, sem formato estruturado claro.
@@ -200,6 +268,8 @@ Definições:
 
 Critérios:
 - O usuário pode escrever de forma torta, incompleta ou informal.
+- Quando o usuário quer saber se existe um item específico, prefira structured_lookup_cost.
+- Quando o usuário quer listar tudo, prefira structured_list_costs.
 - Priorize semantic_rag quando a pergunta não for claramente matemática/estruturada.
 - Use clarify quando a pergunta estiver curta ou ambígua demais para agir com segurança.
 - Responda SOMENTE com JSON válido.
@@ -228,7 +298,6 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     if not text:
         raise ValueError("Resposta vazia da Mistral")
 
-    # remove code fences
     if text.startswith("```"):
         text = text.strip()
 

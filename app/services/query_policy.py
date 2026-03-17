@@ -132,6 +132,62 @@ def _looks_like_diff(question: str) -> bool:
     ])
 
 
+def _looks_like_cost_lookup(question: str) -> bool:
+    q = normalize_text(question)
+
+    lookup_terms = [
+        "teve",
+        "tem",
+        "existe",
+        "existiu",
+        "ha",
+        "há",
+        "houve",
+        "algum",
+        "alguma",
+    ]
+
+    list_terms = [
+        "quais custos",
+        "quais sao os custos",
+        "quais são os custos",
+        "listar custos",
+        "liste os custos",
+        "mostre os custos",
+        "quais gastos",
+        "quais despesas",
+    ]
+
+    if any(term in q for term in list_terms):
+        return False
+
+    return any(term in q for term in lookup_terms)
+
+
+def _looks_like_cost_domain(question: str) -> bool:
+    q = normalize_text(question)
+    return any(term in q for term in [
+        "custo",
+        "custos",
+        "gasto",
+        "gastos",
+        "despesa",
+        "despesas",
+        "locacao",
+        "locação",
+        "aluguel",
+        "diaria",
+        "diária",
+        "container",
+        "peao",
+        "peão",
+        "material",
+        "servico",
+        "serviço",
+        "fornecedor",
+    ])
+
+
 async def apply_route_policy(
     question: str,
     entities: Dict[str, Optional[str]],
@@ -145,7 +201,9 @@ async def apply_route_policy(
     has_snapshot = await has_snapshot_for_scope(entities)
     has_diff = await has_diff_for_scope(entities)
 
-    has_min_scope = bool(entities.get("obra") or entities.get("folder") or entities.get("file_name"))
+    has_min_scope = bool(
+        entities.get("obra") or entities.get("folder") or entities.get("file_name")
+    )
 
     # 1) Sem escopo mínimo e modelo já acha que precisa escopo
     if not has_min_scope and needs_scope:
@@ -190,6 +248,16 @@ async def apply_route_policy(
             "has_diff": has_diff,
         }
 
+    if _looks_like_cost_lookup(question) and _looks_like_cost_domain(question) and has_snapshot:
+        return {
+            "route": "structured_lookup_cost",
+            "confidence": max(confidence, 0.96),
+            "reason": "policy_specific_cost_lookup_with_snapshot",
+            "policy_adjusted": route != "structured_lookup_cost",
+            "has_snapshot": has_snapshot,
+            "has_diff": has_diff,
+        }
+
     if _looks_like_cost_listing(question) and has_snapshot:
         return {
             "route": "structured_list_costs",
@@ -225,6 +293,7 @@ async def apply_route_policy(
         "structured_total",
         "structured_last",
         "structured_list_costs",
+        "structured_lookup_cost",
         "structured_insights",
         "structured_max_cost",
     } and not has_snapshot:
