@@ -389,7 +389,7 @@ def search_qdrant(question: str, scope: Dict[str, Optional[str]]) -> List[Dict[s
             _log(f"[semantic][search][error] stage={label} err={type(e).__name__}:{e}")
 
     merged_hits = _dedupe_hits(merged_hits)
-    ranked_hits = _rerank_hits(question, merged_hits)
+    ranked_hits = _rerank_hits(question, scope, merged_hits)
     final_hits = ranked_hits[:SEMANTIC_FINAL_TOP_K]
 
     for idx, hit in enumerate(final_hits[:5], start=1):
@@ -398,6 +398,7 @@ def search_qdrant(question: str, scope: Dict[str, Optional[str]]) -> List[Dict[s
             f"final={hit['final_score']:.4f} "
             f"vector={hit['vector_score']:.4f} "
             f"bonus={hit['keyword_bonus']:.4f} "
+            f"obra_bonus={hit.get('obra_bonus', 0.0):.4f} "
             f"obra={hit.get('obra_name')} "
             f"arquivo={hit.get('file_name')} "
             f"aba={hit.get('sheet')} "
