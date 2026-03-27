@@ -1060,7 +1060,7 @@ async def handle_structured_insights(
             valid_rows.append(
                 {
                     "DATA": r.get("DATA"),
-                    "DESC_CUSTO": r.get("DESC_CUSTO"),
+                    "DESC_CUSTO": str(r.get("DESC_CUSTO") or "sem descrição").strip(),
                     "VLR_CUSTO": v,
                 }
             )
@@ -1077,31 +1077,156 @@ async def handle_structured_insights(
 
     total = sum(r["VLR_CUSTO"] for r in valid_rows)
     maior = max(valid_rows, key=lambda x: x["VLR_CUSTO"])
+    media = total / len(valid_rows) if valid_rows else 0.0
 
+    # frequência por descrição
     freq: Dict[str, int] = {}
     for r in valid_rows:
-        desc = str(r.get("DESC_CUSTO", "sem descrição")).strip()
+        desc = r["DESC_CUSTO"]
         freq[desc] = freq.get(desc, 0) + 1
 
-    recorrentes = [k for k, v in freq.items() if v > 1]
+    freq_ordenada = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+    recorrentes = [desc for desc, qtd in freq_ordenada if qtd > 1]
+    padroes_relevantes = [(desc, qtd) for desc, qtd in freq_ordenada if qtd > 1]
+    mais_recorrente = padroes_relevantes[0] if padroes_relevantes else None
 
-    insights = [
+    # concentração de valor por descrição
+    total_por_desc: Dict[str, float] = {}
+    for r in valid_rows:
+        desc = r["DESC_CUSTO"]
+        total_por_desc[desc] = total_por_desc.get(desc, 0.0) + float(r["VLR_CUSTO"])
+
+    top_gastos = sorted(total_por_desc.items(), key=lambda x: x[1], reverse=True)
+
+    # participação percentual do maior grupo
+    maior_concentracao = None
+    if top_gastos and total > 0:
+        desc_top, val_top = top_gastos[0]
+        perc_top = (val_top / total) * 100
+        maior_concentracao = {
+            "descricao": desc_top,
+            "valor": val_top,
+            "percentual": perc_top,
+        }
+
+    # outliers simples: custo > 2x média
+    outliers = [r for r in valid_rows if r["VLR_CUSTO"] > (media * 2)] if media > 0 else []
+
+    insights: List[str] = [
         f"Total atual: R$ {_format_money(total)}.",
+        f"Quantidade de lançamentos: {len(valid_rows)}.",
+        f"Ticket médio por lançamento: R$ {_format_money(media)}.",
         f"Maior custo identificado: {maior['DESC_CUSTO']} (R$ {_format_money(maior['VLR_CUSTO'])}).",
     ]
 
-    if recorrentes:
+    if padroes_relevantes:
         insights.append(
-            "Custos recorrentes identificados: " + ", ".join(recorrentes[:10]) + "."
+            "Padrões recorrentes identificados: "
+            + ", ".join([f"{desc} ({qtd}x)" for desc, qtd in padroes_relevantes[:5]])
+            + "."
+        )
+
+    if mais_recorrente:
+        insights.append(
+            f"Item mais recorrente: {mais_recorrente[0]} ({mais_recorrente[1]} lançamentos)."
+        )
+
+    if maior_concentracao:
+        insights.append(
+            f"Maior concentração de gasto: {maior_concentracao['descricao']} "
+            f"(R$ {_format_money(maior_concentracao['valor'])}, "
+            f"{maior_concentracao['percentual']:.1f}% do total)."
+        )
+
+    if outliers:
+        insights.append(
+            "Possíveis lançamentos fora do padrão: "
+            + ", ".join(
+                [
+                    f"{r['DESC_CUSTO']} (R$ {_format_money(r['VLR_CUSTO'])})"
+                    for r in outliers[:5]
+                ]
+            )
+            + "."
+        )
+
+    # alertas simples
+    alerts: List[str] = []
+
+    if maior_concentracao and maior_concentracao["percentual"] >= 50:
+        alerts.append(
+            f"Gasto concentrado em '{maior_concentracao['descricao']}', representando "
+            f"{maior_concentracao['percentual']:.1f}% do total."
+        )
+
+    if len(outliers) >= 2:
+        alerts.append(
+            f"Foram identificados {len(outliers)} lançamentos acima de 2x a média, o que pode indicar exceções relevantes."
+        )
+
+    answer_parts = ["Insights automáticos:\n- " + "\n- ".join(insights)]
+
+    if alerts:
+        answer_parts.append(
+            "\nAlertas:\n- " + "\n- ".join(alerts)
         )
 
     return {
-        "answer": "Insights automáticos:\n- " + "\n- ".join(insights),
+        "answer": "".join(answer_parts),
         "status": "ok",
         "data": {
             "total": total,
-            "maior_custo": maior,
+            "formatted_total": _format_money(total),
+            "count_lancamentos": len(valid_rows),
+            "ticket_medio": media,
+            "formatted_ticket_medio": _format_money(media),
+            "maior_custo": {
+                "descricao": maior["DESC_CUSTO"],
+                "valor": maior["VLR_CUSTO"],
+                "formatted_valor": _format_money(maior["VLR_CUSTO"]),
+                "data": maior.get("DATA"),
+            },
             "recorrentes": recorrentes,
+            "padroes_relevantes": [
+                {"descricao": desc, "quantidade": qtd}
+                for desc, qtd in padroes_relevantes
+            ],
+            "mais_recorrente": (
+                {
+                    "descricao": mais_recorrente[0],
+                    "quantidade": mais_recorrente[1],
+                }
+                if mais_recorrente
+                else None
+            ),
+            "top_gastos": [
+                {
+                    "descricao": desc,
+                    "valor": valor,
+                    "formatted_valor": _format_money(valor),
+                }
+                for desc, valor in top_gastos[:10]
+            ],
+            "maior_concentracao": (
+                {
+                    "descricao": maior_concentracao["descricao"],
+                    "valor": maior_concentracao["valor"],
+                    "formatted_valor": _format_money(maior_concentracao["valor"]),
+                    "percentual": round(maior_concentracao["percentual"], 2),
+                }
+                if maior_concentracao
+                else None
+            ),
+            "outliers": [
+                {
+                    "descricao": r["DESC_CUSTO"],
+                    "valor": r["VLR_CUSTO"],
+                    "formatted_valor": _format_money(r["VLR_CUSTO"]),
+                    "data": r.get("DATA"),
+                }
+                for r in outliers[:10]
+            ],
+            "alerts": alerts,
             "effective_scope": effective_scope,
             "source": "snapshot_insights",
         },

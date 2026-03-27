@@ -187,6 +187,23 @@ def _looks_like_cost_domain(question: str) -> bool:
         "fornecedor",
     ])
 
+def _looks_like_pattern_insight(question: str) -> bool:
+    q = normalize_text(question)
+    return any(term in q for term in [
+        "padrao",
+        "padrão",
+        "tendencia",
+        "tendência",
+        "recorrente",
+        "recorrencia",
+        "recorrência",
+        "frequente",
+        "se repete",
+        "repeticao",
+        "repetição",
+        "comportamento",
+    ])
+
 
 async def apply_route_policy(
     question: str,
@@ -204,6 +221,7 @@ async def apply_route_policy(
     has_min_scope = bool(
         entities.get("obra") or entities.get("folder") or entities.get("file_name")
     )
+
 
     # 1) Sem escopo mínimo e modelo já acha que precisa escopo
     if not has_min_scope and needs_scope:
@@ -337,6 +355,7 @@ async def apply_route_policy(
             "has_diff": has_diff,
         }
 
+
     # 6) Se semantic e não há escopo nenhum e baixa confiança, clarifica
     if route == "semantic_rag" and not has_min_scope and confidence < 0.60:
         return {
@@ -348,6 +367,17 @@ async def apply_route_policy(
             "has_diff": has_diff,
         }
 
+    if _looks_like_pattern_insight(question) and has_snapshot:
+        return {
+            "route": "structured_insights",
+            "confidence": max(confidence, 0.96),
+            "reason": "policy_pattern_insight_with_snapshot",
+            "policy_adjusted": route != "structured_insights",
+            "has_snapshot": has_snapshot,
+            "has_diff": has_diff,
+        }
+
+
     # 7) Mantém rota original
     return {
         "route": route,
@@ -357,3 +387,4 @@ async def apply_route_policy(
         "has_snapshot": has_snapshot,
         "has_diff": has_diff,
     }
+

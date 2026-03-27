@@ -190,6 +190,18 @@ def _fallback_route(question: str) -> Dict[str, Any]:
         "o que os dados mostram",
         "interpreta",
         "interpretar",
+        "padrao",
+        "padrão",
+        "tendencia",
+        "tendência",
+        "recorrente",
+        "recorrencia",
+        "recorrência",
+        "frequente",
+        "se repete",
+        "repeticao",
+        "repetição",
+        "comportamento",
     ]):
         return {
             "route": "structured_insights",
@@ -261,7 +273,7 @@ Definições:
 - structured_last: último lançamento, última atualização, item mais recente.
 - structured_list_costs: listar custos, mostrar custos, quais despesas/gastos de forma ampla.
 - structured_lookup_cost: verificar se existe um custo específico, item específico ou tipo específico. Ex.: "teve peão?", "tem diária?", "existe container?", "houve locação?".
-- structured_insights: análise gerencial, resumo analítico, principais padrões.
+- structured_insights: análise gerencial, resumo analítico, recorrências, padrões, tendências, concentrações de gasto, itens que mais se repetem e possíveis alertas.
 - structured_max_cost: maior custo/gasto/despesa.
 - semantic_rag: pergunta aberta, contextual, explicativa, documental, sem formato estruturado claro.
 - clarify: pergunta vaga, ambígua, incompleta, sem escopo mínimo.
@@ -275,6 +287,7 @@ Critérios:
 - Responda SOMENTE com JSON válido.
 - Não use markdown.
 - Não use bloco de código.
+- Perguntas sobre padrão, recorrência, tendência, comportamento dos custos ou o que mais se repete devem priorizar structured_insights.
 
 Pergunta:
 {question}
