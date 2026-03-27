@@ -266,6 +266,17 @@ async def apply_route_policy(
             "has_diff": has_diff,
         }
 
+
+    if _looks_like_pattern_insight(question) and has_snapshot:
+        return {
+            "route": "structured_insights",
+            "confidence": max(confidence, 0.96),
+            "reason": "policy_pattern_insight_with_snapshot",
+            "policy_adjusted": route != "structured_insights",
+            "has_snapshot": has_snapshot,
+            "has_diff": has_diff,
+        }
+
     if _looks_like_cost_lookup(question) and _looks_like_cost_domain(question) and has_snapshot:
         return {
             "route": "structured_lookup_cost",
@@ -367,15 +378,6 @@ async def apply_route_policy(
             "has_diff": has_diff,
         }
 
-    if _looks_like_pattern_insight(question) and has_snapshot:
-        return {
-            "route": "structured_insights",
-            "confidence": max(confidence, 0.96),
-            "reason": "policy_pattern_insight_with_snapshot",
-            "policy_adjusted": route != "structured_insights",
-            "has_snapshot": has_snapshot,
-            "has_diff": has_diff,
-        }
 
 
     # 7) Mantém rota original
